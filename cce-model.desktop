@@ -7,5 +7,5 @@ Exec=cce-model %f
 Icon=cce-model
 Terminal=false
 Categories=Graphics;3DGraphics;Viewer;
-MimeType=model/stl;model/x.stl-ascii;model/x.stl-binary;application/sla;model/obj;model/gltf+json;model/gltf-binary;
+MimeType=model/stl;model/x.stl-ascii;model/x.stl-binary;application/sla;model/obj;model/gltf+json;model/gltf-binary;model/x-ply;
 NoDisplay=false
