@@ -5,10 +5,11 @@ A viewer for 3D model files. Read the workspace guide
 particular to this crate. The plan it is built to — formats, milestones,
 what each one must pass — is the design doc "cce-model: a general-purpose
 3D viewer" (claude.ai/code/artifact/1ebec744-8990-4884-ad92-73c72e0ea265).
-Milestones 1–4 are here: STL, OBJ, glTF/GLB and PLY read by the shared
+Milestones 1–5 are here: STL, OBJ, glTF/GLB and PLY read by the shared
 `cce-mesh-io` crate, a grid floor, wireframe and normals overlays, sizes in
-the file's units, ←/→ through the folder, drag-and-drop, and a path-traced
-view (`r`).
+the file's units, ←/→ through the folder, drag-and-drop, a path-traced
+view (`r`), and the model drawn through cce-ui's lit pipeline (per-fragment
+light, metallic-roughness, base-colour textures).
 
 ## Shape
 
@@ -19,13 +20,17 @@ view (`r`).
   generation drops a load the user has moved past, and a reader's panic is
   caught there and shown as an error. The model's baked vertices stay on
   the CPU after upload, because `init_3d` runs again for a replacement
-  renderer after a reconnect and every mesh must go back up (360 MB for a
-  5M-triangle model; slimming it is open).
+  renderer after a reconnect and every mesh must go back up (660 MB of lit
+  vertices for a 5M-triangle model; slimming it is open). Textures go up as
+  mipmapped image ids when a model arrives, are freed when it is replaced,
+  and are uploaded again for a replacement renderer (`seen_renderer`).
 - Reading is `cce_mesh_io::load` (see that crate's CLAUDE.md): a `Scene` of
   parts in the file's own coordinates plus its up axis. This app merges the
   parts, turns a Z-up scene upright, fits it to the unit sphere and bakes.
-- `src/light.rs` — the light bake: crease-aware corner normals (from
-  cce-mesh-io) against a fixed key/fill/ambient rig, into `Vertex3D`s.
+- `src/light.rs` — the lit meshes and their light: `lit_parts` turns the
+  mesh into one `LitVertex` list per material (a draw binds one texture),
+  with the file's normals or crease-aware ones; `rig()` is the studio
+  light (key, fill, sky/ground) the lit pipeline shades by.
 - `src/camera.rs` — orbit camera: yaw, pitch, distance about a pivot.
 - `src/overlay.rs` — the line meshes: grid floor (laid out in FILE units on
   1-2-5 steps through the file's origin, then fitted), edges, normals.
@@ -44,12 +49,12 @@ view (`r`).
 
 ## Things that are not obvious
 
-- **Smooth shading is baked.** cce-ui's `Vertex3D` is position + colour, and
-  its own shading is flat (screen-space derivatives). A `prelit` draw shows
-  the vertex colours as they are, so `light::bake` lights every corner from
-  its normal against a fixed studio rig (key, fill, sky/ground ambient). The
-  rig is fixed in world space, so the bake never changes as the camera moves.
-  Faces meeting past `CREASE_DEGREES` keep their own normals.
+- **The model is drawn lit, not baked** (since milestone 5): `LitDraw`s
+  staged after `stage_scene`, each `before` the first wire draw so the
+  background and grid go under and the overlays over. Until then the light
+  was baked into `Vertex3D` colours on the CPU, which could show neither a
+  texture nor a highlight that moves. `Stage3D::lit()` is `None` on a
+  renderer without the pipeline; the app then says it cannot draw.
 - **Every model is moved into the unit sphere** (`Mesh::fit_to_unit`)
   before it is baked, so the camera frames every file alike. (Until
   cce-ui 38bcad1 this was also a workaround: any vertex near z = 9.99 was

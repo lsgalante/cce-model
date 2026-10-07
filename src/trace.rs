@@ -4,7 +4,10 @@
 //! emission, linear) in the space the camera's inverse mvp unprojects into —
 //! the fitted space the raster pass draws in, so one camera serves both.
 //! The model goes in with a colour per triangle (its corner colours
-//! averaged, or its palette colour), deduplicated into materials, over a
+//! averaged, or its material's colour, times its texture sampled at the
+//! triangle's centre: the tracer has no textures, and at the density a
+//! texture is worth having, one texel a triangle reads well), deduplicated
+//! into materials, over a
 //! wide ground plane at the grid's height, so the traced model stands on
 //! something and casts a shadow; the grid's lines, which are not surfaces,
 //! have no place in it.
@@ -12,7 +15,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use cce_mesh_io::Mesh;
+use cce_mesh_io::{srgb_to_linear, Mesh, Texture};
 use cce_ui::engine::{RtEnvironment, RtMaterial, RtTriangle};
 
 /// Samples to refine to: enough for the tracer's denoiser to settle, and
@@ -50,7 +53,7 @@ pub fn environment(key: [f32; 3]) -> RtEnvironment {
 }
 
 /// The model's triangles and a ground plane under them at `floor_y`.
-pub fn scene(mesh: &Mesh, floor_y: f32) -> (Vec<RtTriangle>, Vec<RtMaterial>) {
+pub fn scene(mesh: &Mesh, textures: &[Texture], floor_y: f32) -> (Vec<RtTriangle>, Vec<RtMaterial>) {
     let mut materials: Vec<RtMaterial> = Vec::new();
     let mut slot: HashMap<[u16; 3], u32> = HashMap::new();
     let mut material_for = |c: [f32; 3]| -> u32 {
@@ -62,12 +65,17 @@ pub fn scene(mesh: &Mesh, floor_y: f32) -> (Vec<RtTriangle>, Vec<RtMaterial>) {
     };
     let mut triangles = Vec::with_capacity(mesh.triangles.len() + 2);
     for (t, tri) in mesh.triangles.iter().enumerate() {
-        let colour = if mesh.corner_colors.is_some() {
+        let mut colour = if mesh.corner_colors.is_some() {
             let [a, b, c] = [0, 1, 2].map(|k| mesh.corner_color(t, k));
             [0, 1, 2].map(|i| (a[i] + b[i] + c[i]) / 3.0)
         } else {
             mesh.corner_color(t, 0)
         };
+        if let (Some(tex), Some(uvs)) = (mesh.material(t).texture.and_then(|i| textures.get(i)), &mesh.corner_uvs) {
+            let [a, b, c] = [uvs[t * 3], uvs[t * 3 + 1], uvs[t * 3 + 2]];
+            let texel = tex.sample([(a[0] + b[0] + c[0]) / 3.0, (a[1] + b[1] + c[1]) / 3.0]);
+            colour = [0, 1, 2].map(|i| colour[i] * srgb_to_linear(texel[i]));
+        }
         let [p0, p1, p2] = tri.map(|i| mesh.positions[i as usize].to_array());
         triangles.push(RtTriangle { p0, p1, p2, material: material_for(colour) });
     }
@@ -107,15 +115,16 @@ mod tests {
         Mesh {
             positions: vec![Vec3::ZERO, Vec3::X, Vec3::new(1.0, 1.0, 0.0), Vec3::Y],
             triangles: vec![[0, 1, 2], [0, 2, 3]],
-            tri_color: vec![0, 0],
-            colors: vec![[0.5, 0.25, 0.0]],
+            tri_material: vec![0, 0],
+            materials: vec![cce_mesh_io::Material::colour([0.5, 0.25, 0.0])],
             corner_colors,
+            ..Mesh::default()
         }
     }
 
     #[test]
     fn the_model_stands_on_a_ground_plane() {
-        let (tris, mats) = scene(&quad(None), -1.0);
+        let (tris, mats) = scene(&quad(None), &[], -1.0);
         assert_eq!(tris.len(), 2 + 2);
         assert_eq!(mats.len(), 2, "one model colour and the ground");
         let ground = &tris[2];
@@ -129,9 +138,19 @@ mod tests {
     #[test]
     fn corner_colours_are_averaged_and_shared() {
         let red = [1.0, 0.0, 0.0];
-        let (tris, mats) = scene(&quad(Some(vec![red; 6])), 0.0);
+        let (tris, mats) = scene(&quad(Some(vec![red; 6])), &[], 0.0);
         assert_eq!(tris[0].material, tris[1].material, "two red triangles share one material");
         assert_eq!(mats[tris[0].material as usize].albedo, red);
+    }
+
+    #[test]
+    fn a_textured_triangle_takes_its_texel() {
+        let mut m = quad(None);
+        m.materials[0] = cce_mesh_io::Material { color: [1.0; 3], texture: Some(0), ..Default::default() };
+        m.corner_uvs = Some(vec![[0.1, 0.5]; 6]);
+        let tex = Texture { width: 2, height: 1, rgba: vec![255, 0, 0, 255, 0, 0, 255, 255] };
+        let (tris, mats) = scene(&m, &[tex], 0.0);
+        assert_eq!(mats[tris[0].material as usize].albedo, [1.0, 0.0, 0.0], "the left texel, red");
     }
 
     #[test]

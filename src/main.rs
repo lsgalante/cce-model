@@ -2,10 +2,11 @@
 //!
 //! Opens STL, OBJ, glTF/GLB and PLY (read by cce-mesh-io), frames the model
 //! in a three-quarter view over a grid floor and lets you turn it. Files are
-//! read and lit on a worker thread (`cce_mesh_io::load` + `light::bake`),
-//! then uploaded once and drawn through cce-ui's scene pass as one prelit
-//! mesh under a screen-space background gradient. The whole window is the
-//! scene. The wireframe and normals overlays are built on a worker the
+//! read and split into lit meshes on a worker thread (`cce_mesh_io::load`
+//! + `light::lit_parts`, one per material), then uploaded once and drawn
+//! through cce-ui's lit pipeline — per-fragment light, metallic-roughness
+//! specular, base-colour textures — between a screen-space background
+//! gradient and the grid. The whole window is the scene. The wireframe and normals overlays are built on a worker the
 //! first time either is asked for, so a big model does not pay for them
 //! unless they are wanted.
 //!
@@ -31,10 +32,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use cce_mesh_io::{Mesh, Unit, UpAxis};
+use cce_mesh_io::{Mesh, Texture, Unit, UpAxis};
 use cce_ui::engine::{
-    AppSender, Application, LogicalPosition, LogicalSize, MeshId, PreparedRtScene, RtCamera, SceneDraw, Stage3D,
-    Vertex3D, WindowSettings,
+    AppSender, Application, LitDraw, LitMaterial, LitMeshId, LogicalPosition, LogicalSize, MeshId, PreparedRtScene,
+    RtCamera, SceneDraw, Stage3D, Vertex3D, WindowSettings,
 };
 use cce_ui::scene::layout::Rect;
 use cce_ui::scene::paint::{DisplayList, PaintCtx};
@@ -88,8 +89,9 @@ struct Model {
     size: Vec3,
     unit: Unit,
     /// Kept after upload: a replacement renderer (a reconnect) starts with
-    /// no meshes, and these are what go back up.
-    verts: Vec<Vertex3D>,
+    /// no meshes and no images, and these are what go back up.
+    surfaces: Vec<light::LitPart>,
+    textures: Vec<Texture>,
     grid: Vec<Vertex3D>,
     grid_step: f32,
     /// The grid's height in the fitted space: where the traced ground is.
@@ -98,7 +100,8 @@ struct Model {
 
 impl Model {
     fn read(path: &Path) -> Result<Model, String> {
-        let scene = cce_mesh_io::load(path)?;
+        let mut scene = cce_mesh_io::load(path)?;
+        let textures = std::mem::take(&mut scene.textures);
         let mut mesh = scene.merged();
         // STL is Z-up by convention; the view is Y-up. Turned here, not by
         // the reader, which reports the file as it is.
@@ -115,7 +118,8 @@ impl Model {
             parts: scene.parts.len(),
             size: hi - lo,
             unit: scene.unit,
-            verts: light::bake(&mesh),
+            surfaces: light::lit_parts(&mesh),
+            textures,
             mesh,
             grid: grid.lines,
             grid_step: grid.step,
@@ -135,7 +139,10 @@ struct Overlays {
 /// in place after, so stepping through a folder does not leak meshes.
 struct Gpu {
     background: MeshId,
-    model: Option<MeshId>,
+    /// One lit mesh per material; slots are reused by the next model, and
+    /// only the first `model_parts` belong to the current one.
+    model: Vec<LitMeshId>,
+    model_parts: usize,
     grid: Option<MeshId>,
     edges: Option<MeshId>,
     normals: Option<MeshId>,
@@ -173,6 +180,12 @@ struct ModelApp {
     loading: Option<PathBuf>,
     model: Option<Arc<Model>>,
     error: Option<String>,
+    /// The model's textures as this renderer's image ids, by the scene's
+    /// texture index (`None` for one that is not uploaded).
+    texture_ids: Vec<Option<u32>>,
+    /// Whether a renderer has been handed over yet: a later one is a
+    /// replacement, and every image id died with the old one.
+    seen_renderer: bool,
     /// The folder's models, for ←/→, and where the open one is among them.
     files: Vec<PathBuf>,
     file_at: usize,
@@ -287,7 +300,7 @@ impl ModelApp {
         std::thread::spawn(move || {
             let started = std::time::Instant::now();
             let edges = Arc::new(overlay::edges(&model.mesh));
-            let normals = Arc::new(overlay::normals(&model.mesh, light::CREASE_DEGREES));
+            let normals = Arc::new(overlay::normals(&model.mesh, &light::normals(&model.mesh)));
             log::info!(
                 "[model] {} edges and {} normals in {:.0} ms",
                 edges.len() / 2,
@@ -296,6 +309,21 @@ impl ModelApp {
             );
             let _ = sender.send(Message::Overlays { generation, edges, normals });
         });
+    }
+
+    /// Upload the model's textures (mipmapped: they are seen small as well
+    /// as large), freeing the ids of the ones before.
+    fn upload_textures(&mut self) {
+        for id in self.texture_ids.drain(..).flatten() {
+            cce_ui::draw::free_image(id);
+        }
+        if let Some(m) = &self.model {
+            self.texture_ids = m
+                .textures
+                .iter()
+                .map(|t| Some(cce_ui::draw::upload_rgba_mipmapped(t.rgba.clone(), t.width, t.height)))
+                .collect();
+        }
     }
 
     /// Build the tracer's scene on a worker, if the traced view is wanted
@@ -309,7 +337,7 @@ impl ModelApp {
         let (generation, sender, with_bvh) = (self.generation, self.sender.clone(), self.rt_needs_bvh);
         std::thread::spawn(move || {
             let started = Instant::now();
-            let (triangles, materials) = trace::scene(&model.mesh, model.floor_y);
+            let (triangles, materials) = trace::scene(&model.mesh, &model.textures, model.floor_y);
             let n_materials = materials.len();
             let scene = PreparedRtScene::new(triangles, &materials, None, with_bvh);
             log::info!(
@@ -444,6 +472,8 @@ impl Application for ModelApp {
             loading: None,
             model: None,
             error: None,
+            texture_ids: Vec::new(),
+            seen_renderer: false,
             files: Vec::new(),
             file_at: 0,
             overlays: None,
@@ -498,8 +528,15 @@ impl Application for ModelApp {
                 self.loading = None;
                 match result {
                     Ok(model) => {
-                        log::info!("[model] {}: {} triangles", path.display(), model.mesh.triangles.len());
+                        log::info!(
+                            "[model] {}: {} triangles, {} materials, {} textures",
+                            path.display(),
+                            model.mesh.triangles.len(),
+                            model.surfaces.len(),
+                            model.textures.len()
+                        );
                         self.model = Some(model);
+                        self.upload_textures();
                         self.overlays = None;
                         self.building_overlays = false;
                         self.pending = Pending { model: true, grid: true, edges: false, normals: false };
@@ -579,7 +616,15 @@ impl Application for ModelApp {
         ]);
         stage.set_scene_light(light::KEY.normalize().to_array());
         self.rt_needs_bvh = stage.rt_needs_bvh();
-        self.gpu = Some(Gpu { background, model: None, grid: None, edges: None, normals: None });
+        match stage.lit() {
+            Some(lit) => lit.set_lit_light(light::rig()),
+            None => self.error = Some("this renderer has no lit pipeline; nothing can be drawn".into()),
+        }
+        // A replacement renderer: the images went with the old one.
+        if std::mem::replace(&mut self.seen_renderer, true) {
+            self.upload_textures();
+        }
+        self.gpu = Some(Gpu { background, model: Vec::new(), model_parts: 0, grid: None, edges: None, normals: None });
         let has = self.model.is_some();
         let built = self.overlays.is_some();
         self.pending = Pending { model: has, grid: has, edges: built, normals: built };
@@ -594,12 +639,19 @@ impl Application for ModelApp {
         let Some(gpu) = self.gpu.as_mut() else { return false };
         let pending = std::mem::take(&mut self.pending);
         if let Some(m) = &self.model {
-            if pending.model {
+            if let (true, Some(lit)) = (pending.model, stage.lit()) {
                 // On the UI thread, unavoidably: the stage is only lent here.
                 // Logged, because it is the one part of a load the window waits on.
                 let started = std::time::Instant::now();
-                upload(stage, &mut gpu.model, &m.verts);
-                log::info!("[model] uploaded {} vertices in {:.0} ms", m.verts.len(), started.elapsed().as_secs_f64() * 1e3);
+                for (i, part) in m.surfaces.iter().enumerate() {
+                    match gpu.model.get(i) {
+                        Some(&id) => lit.update_lit_mesh(id, &part.verts),
+                        None => gpu.model.push(lit.create_lit_mesh(&part.verts)),
+                    }
+                }
+                gpu.model_parts = m.surfaces.len();
+                let count: usize = m.surfaces.iter().map(|p| p.verts.len()).sum();
+                log::info!("[model] uploaded {count} vertices in {:.0} ms", started.elapsed().as_secs_f64() * 1e3);
             }
             if pending.grid {
                 upload(stage, &mut gpu.grid, &m.grid);
@@ -669,14 +721,30 @@ impl Application for ModelApp {
         let line_width = scale as f32;
         let lines = |mesh| SceneDraw { wireframe: true, line_width, ..draw(mesh, mvp) };
         let mut draws = vec![SceneDraw { screen_space: true, ..draw(gpu.background, mvp) }];
-        if self.model.is_some() {
+        let mut lit_draws = Vec::new();
+        if let Some(m) = &self.model {
             let wire = self.show_wire && self.overlays.is_some();
             if let (true, Some(id)) = (self.show_grid, gpu.grid) {
                 draws.push(lines(id));
             }
-            if let Some(id) = gpu.model {
-                let base = if wire { line_width } else { 0.0 };
-                draws.push(SceneDraw { prelit: true, wire_base_width: base, ..draw(id, mvp) });
+            // The model, after the background and grid and before the wires.
+            let eye = self.camera.eye().to_array();
+            for (part, &id) in m.surfaces.iter().zip(&gpu.model).take(gpu.model_parts) {
+                let mat = &part.material;
+                lit_draws.push(LitDraw {
+                    mesh: id,
+                    mvp,
+                    eye,
+                    material: LitMaterial {
+                        base_color: mat.color,
+                        texture: mat.texture.and_then(|t| self.texture_ids.get(t).copied().flatten()),
+                        metallic: mat.metallic,
+                        roughness: mat.roughness,
+                    },
+                    opacity: 1.0,
+                    wire_base_width: if wire { line_width } else { 0.0 },
+                    before: draws.len() as u32,
+                });
             }
             if let (true, Some(id)) = (wire, gpu.edges) {
                 draws.push(SceneDraw { opacity: WIRE_OPACITY, ..lines(id) });
@@ -686,6 +754,9 @@ impl Application for ModelApp {
             }
         }
         stage.stage_scene((0, 0, pw, ph), draws);
+        if let Some(lit) = stage.lit() {
+            lit.stage_lit(lit_draws);
+        }
         tracing
     }
 

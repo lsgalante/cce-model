@@ -111,16 +111,15 @@ pub fn edges(mesh: &Mesh) -> Vec<Vertex3D> {
     out
 }
 
-/// A short line out of each point along each normal it is lit with — one
-/// per point on a smooth surface, one per face meeting at a crease — and
-/// every n-th of them past [`MAX_NORMALS`].
+/// A short line out of each point along each normal it is lit with
+/// (`corner`, three per triangle) — one per point on a smooth surface, one
+/// per face meeting at a crease — and every n-th of them past [`MAX_NORMALS`].
 ///
 /// Each is about as long as the gap between the normals drawn (the square
 /// root of the surface's area over their number), up to [`NORMAL_LENGTH`]:
 /// at a fixed length, a dense model's normals overlap into a fur that hides
 /// the surface they describe.
-pub fn normals(mesh: &Mesh, crease_degrees: f32) -> Vec<Vertex3D> {
-    let corner = mesh.corner_normals(crease_degrees);
+pub fn normals(mesh: &Mesh, corner: &[Vec3]) -> Vec<Vertex3D> {
     let mut seen: HashSet<(u32, [i16; 3])> = HashSet::new();
     let mut picked: Vec<(Vec3, Vec3)> = Vec::new();
     for (t, tri) in mesh.triangles.iter().enumerate() {
@@ -165,9 +164,9 @@ mod tests {
         Mesh {
             positions: (0..8).map(p).collect(),
             triangles: quads.iter().flat_map(|q| [[q[0], q[1], q[2]], [q[0], q[2], q[3]]]).collect(),
-            tri_color: vec![0; 12],
-            colors: vec![cce_mesh_io::CLAY],
-            corner_colors: None,
+            tri_material: vec![0; 12],
+            materials: vec![cce_mesh_io::Material::default()],
+            ..Mesh::default()
         }
     }
 
@@ -180,7 +179,8 @@ mod tests {
     #[test]
     fn a_cube_has_three_normals_a_corner() {
         // Every corner meets three faces at 90°, past the crease.
-        assert_eq!(normals(&cube(), 40.0).len(), 8 * 3 * 2);
+        let c = cube();
+        assert_eq!(normals(&c, &c.corner_normals(40.0)).len(), 8 * 3 * 2);
     }
 
     #[test]
@@ -221,8 +221,8 @@ mod tests {
                 m.triangles.push([a + 1, a + n as u32 + 1, a + n as u32]);
             }
         }
-        m.tri_color = vec![0; m.triangles.len()];
-        let lines = normals(&m, 40.0).len() / 2;
+        m.tri_material = vec![0; m.triangles.len()];
+        let lines = normals(&m, &m.corner_normals(40.0)).len() / 2;
         assert!(lines <= MAX_NORMALS && lines > MAX_NORMALS / 3, "{lines}");
     }
 }
