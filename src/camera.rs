@@ -16,8 +16,10 @@ const MAX_PITCH: f32 = 89.0 * std::f32::consts::PI / 180.0;
 /// The three-quarter view a model opens in.
 const HOME_YAW: f32 = 35.0 * std::f32::consts::PI / 180.0;
 const HOME_PITCH: f32 = 22.0 * std::f32::consts::PI / 180.0;
+/// How far from the pivot, in model radii, the clip planes keep the scene.
+const CLIP_RADII: f32 = 3.0;
 /// Room left around a framed model, as a share of its size.
-const FRAME_MARGIN: f32 = 1.15;
+const FRAME_MARGIN: f32 = 1.3;
 
 #[derive(Debug, Clone)]
 pub struct Camera {
@@ -48,10 +50,12 @@ impl Camera {
 
     /// Projection times view, for a viewport `aspect` wide per unit high.
     pub fn view_proj(&self, aspect: f32) -> Mat4 {
-        // The clip planes hug the model: near as far out as it allows (depth
-        // precision lives there), far just past its back.
-        let near = (self.distance - 1.5 * self.radius).max(self.distance * 0.01);
-        let far = self.distance + 1.5 * self.radius;
+        // The clip planes hug the scene: near as far out as it allows (depth
+        // precision lives there), far just past its back. The scene is the
+        // model AND the grid floor under it, whose corners reach about 2.5
+        // radii from the centre; hence 3.
+        let near = (self.distance - CLIP_RADII * self.radius).max(self.distance * 0.01);
+        let far = self.distance + CLIP_RADII * self.radius;
         let proj = Mat4::perspective_rh(FOV_Y_DEGREES.to_radians(), aspect.max(1e-3), near, far.max(near * 2.0));
         proj * Mat4::look_at_rh(self.eye(), self.pivot, Vec3::Y)
     }

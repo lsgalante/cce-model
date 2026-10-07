@@ -5,8 +5,9 @@ A viewer for 3D model files. Read the workspace guide
 particular to this crate. The plan it is built to — formats, milestones,
 what each one must pass — is the design doc "cce-model: a general-purpose
 3D viewer" (claude.ai/code/artifact/1ebec744-8990-4884-ad92-73c72e0ea265).
-Milestones 1 and 2 are here: STL, OBJ, glTF/GLB and PLY, read by the
-shared `cce-mesh-io` crate, on the existing raster stage.
+Milestones 1–3 are here: STL, OBJ, glTF/GLB and PLY read by the shared
+`cce-mesh-io` crate, a grid floor, wireframe and normals overlays, sizes in
+the file's units, ←/→ through the folder and drag-and-drop.
 
 ## Shape
 
@@ -25,6 +26,16 @@ shared `cce-mesh-io` crate, on the existing raster stage.
 - `src/light.rs` — the light bake: crease-aware corner normals (from
   cce-mesh-io) against a fixed key/fill/ambient rig, into `Vertex3D`s.
 - `src/camera.rs` — orbit camera: yaw, pitch, distance about a pivot.
+- `src/overlay.rs` — the line meshes: grid floor (laid out in FILE units on
+  1-2-5 steps through the file's origin, then fitted), edges, normals.
+  Edges and normals are built on a worker the first time `w` or `n` asks
+  (`Message::Overlays`, tied to the load's generation). No wireframe past
+  `MAX_WIRE_TRIANGLES` (2M): it paints the model solid and costs 360 MB;
+  normals are thinned to `MAX_NORMALS` and drawn as long as their spacing.
+- `src/units.rs` — sizes in mm/m only when the format says what its unit
+  is (`cce_mesh_io::Unit`); OBJ and PLY sizes are bare numbers.
+- `src/files.rs` — the folder's models for ←/→ (any file opened from
+  outside the list makes its folder the list) and `text/uri-list` drops.
 
 ## Things that are not obvious
 
@@ -44,6 +55,11 @@ shared `cce-mesh-io` crate, on the existing raster stage.
 - **A staged scene persists** in the backdrop until the next one, so
   `stage_3d` stages only when `scene_dirty` (camera, resize, upload); a HUD
   change repaints the 2D pass alone.
+- **Every GPU slot is created once and updated in place** (`upload`), so
+  stepping through a folder does not leak meshes; `init_3d` clears the
+  slots and marks every CPU-side list pending for a replacement renderer.
+- **The clip planes keep 3 radii** around the pivot, for the grid's
+  corners, not just the model's 1.
 - No root plate, on purpose (`style-audit: opt-out` in `display_list`): the
   scene is the window's content, and a root plate would frost over it.
 
@@ -64,7 +80,15 @@ then `ctl windows` for the id and `shot-window <id>`. The window is
 640×360. `pointer-press` / `pointer-move-by` / `pointer-release` drive an
 orbit, `pointer-pinch 1.6` a zoom, `pointer-scroll 0 -12 finger` then
 `pointer-scroll finger-stop` a scroll orbit and its coast, `keypress 11` the
-`0` key. The window's display is the shadow's
+`0` key, 17/49/34 `w`/`n`/`g`, 105/106 ←/→. A new viewer window can map
+WITHOUT focus (keys then reach nothing, or a stale window): `ctl
+focus-window cce-model` after each launch, and close windows by pid
+(checking `/proc/<pid>/environ` for the shadow's display) — one launched by
+cce-files has argv0 `cce-model`, so a `release/cce-model` match misses it.
+cce-files in a shadow finds the real desktop entries with
+`XDG_DATA_HOME=$HOME/.local/share` and a tree build via a PATH symlink.
+Drops are untested end to end: cce-ui has no drag SOURCE, so no cce app
+can drag a file out. The window's display is the shadow's
 `WAYLAND_DISPLAY` from `cce-shadow env`, which changes when the instance
 restarts — match it when picking processes to stop. The log carries
 `read and lit in N ms` (worker) and `uploaded N vertices in N ms` (the UI

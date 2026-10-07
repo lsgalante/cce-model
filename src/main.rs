@@ -1,21 +1,29 @@
 //! cce-model — a viewer for 3D model files.
 //!
 //! Opens STL, OBJ, glTF/GLB and PLY (read by cce-mesh-io), frames the model
-//! in a three-quarter view and lets you turn it. Files are read and lit on a
-//! worker thread (`cce_mesh_io::load` + `light::bake`), then uploaded once
-//! and drawn through cce-ui's scene pass as one prelit mesh under a
-//! screen-space background gradient. The whole window is the scene.
+//! in a three-quarter view over a grid floor and lets you turn it. Files are
+//! read and lit on a worker thread (`cce_mesh_io::load` + `light::bake`),
+//! then uploaded once and drawn through cce-ui's scene pass as one prelit
+//! mesh under a screen-space background gradient. The whole window is the
+//! scene. The wireframe and normals overlays are built on a worker the
+//! first time either is asked for, so a big model does not pay for them
+//! unless they are wanted.
 //!
 //! Mouse: drag orbits, shift+drag or middle-drag pans, ctrl+wheel and pinch
-//! zoom, a two-finger scroll orbits (and coasts), as in cce-designer.
-//! Keys: o open · 0 frame all · q quit.
+//! zoom, a two-finger scroll orbits (and coasts), as in cce-designer. A file
+//! dropped on the window opens. Keys: o open · ←/→ the folder's other models
+//! · 0 frame all · g grid · w wireframe · n normals · q quit.
 
 mod camera;
+mod files;
 mod light;
+mod overlay;
+mod units;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use cce_mesh_io::{Mesh, Unit, UpAxis};
 use cce_ui::engine::{
     AppSender, Application, LogicalPosition, LogicalSize, MeshId, SceneDraw, Stage3D, Vertex3D, WindowSettings,
 };
@@ -26,7 +34,6 @@ use cce_ui::widget::{ElementState, Key, KeyEvent, MouseButton, MouseScrollDelta,
 use glam::Vec3;
 
 use camera::Camera;
-use cce_mesh_io::UpAxis;
 
 /// Wheel notches in logical px of orbit, and of log-zoom.
 const ORBIT_PX_PER_LINE: f32 = 10.0;
@@ -37,24 +44,36 @@ const ZOOM_PER_PX: f32 = 0.005;
 const SKY_TOP: [f32; 3] = [0.105, 0.11, 0.125];
 const SKY_BOTTOM: [f32; 3] = [0.03, 0.03, 0.035];
 
+/// How strongly the wireframe shows over the model.
+const WIRE_OPACITY: f32 = 0.55;
+
+const HINTS: &str = "o open   ·   ←/→ folder   ·   0 frame   ·   g grid   ·   w wireframe   ·   n normals";
+
 #[derive(Debug, Clone)]
 enum Message {
     /// The model behind an `Arc`: the runner may clone a message, and a
     /// clone must not copy the vertex buffer.
     Loaded { generation: u64, path: PathBuf, result: Result<Arc<Model>, String> },
+    /// The wireframe and the normals of the model of `generation`.
+    Overlays { generation: u64, edges: Arc<Vec<Vertex3D>>, normals: Arc<Vec<Vertex3D>> },
     Quit,
 }
 
-/// A model read, welded and lit, ready to upload.
+/// A model read, welded, fitted and lit, ready to upload.
 #[derive(Debug)]
 struct Model {
     name: String,
-    triangles: usize,
-    /// How many named pieces the file holds (glTF nodes; 1 for the rest).
+    /// In the fitted space it is drawn in: the overlays are built from it.
+    mesh: Mesh,
     parts: usize,
+    /// Its box's sides in file units, upright, and what those units are.
+    size: Vec3,
+    unit: Unit,
     /// Kept after upload: a replacement renderer (a reconnect) starts with
-    /// no meshes, and this is what goes back up.
+    /// no meshes, and these are what go back up.
     verts: Vec<Vertex3D>,
+    grid: Vec<Vertex3D>,
+    grid_step: f32,
 }
 
 impl Model {
@@ -66,24 +85,58 @@ impl Model {
         if scene.up == UpAxis::Z {
             mesh.z_up_to_y_up();
         }
+        let (lo, hi) = mesh.bounds().ok_or("the file holds no points")?;
         // Every model is drawn inside the unit sphere, so the camera frames
         // that sphere whatever the file's units.
-        mesh.fit_to_unit();
+        let (centre, radius) = mesh.fit_to_unit();
+        let grid = overlay::grid(&overlay::Fit { centre, radius, lo, hi });
         Ok(Model {
             name: path.file_name().and_then(|n| n.to_str()).unwrap_or("?").to_string(),
-            triangles: mesh.triangles.len(),
             parts: scene.parts.len(),
+            size: hi - lo,
+            unit: scene.unit,
             verts: light::bake(&mesh),
+            mesh,
+            grid: grid.lines,
+            grid_step: grid.step,
         })
     }
 }
 
-/// What the current renderer holds for us.
+/// The wireframe and normals of the current model, once built.
+struct Overlays {
+    edges: Arc<Vec<Vertex3D>>,
+    normals: Arc<Vec<Vertex3D>>,
+}
+
+/// What the current renderer holds for us. A slot is created at its first
+/// upload (a mesh of no vertices would be a zero-sized buffer) and updated
+/// in place after, so stepping through a folder does not leak meshes.
 struct Gpu {
     background: MeshId,
-    /// Created at the first upload: a mesh of no vertices would be a
-    /// zero-sized buffer.
     model: Option<MeshId>,
+    grid: Option<MeshId>,
+    edges: Option<MeshId>,
+    normals: Option<MeshId>,
+}
+
+/// Which of the CPU-side vertex lists still have to go up.
+#[derive(Default, Clone, Copy)]
+struct Pending {
+    model: bool,
+    grid: bool,
+    edges: bool,
+    normals: bool,
+}
+
+fn upload(stage: &mut dyn Stage3D, slot: &mut Option<MeshId>, verts: &[Vertex3D]) {
+    if verts.is_empty() {
+        return;
+    }
+    match *slot {
+        Some(id) => stage.update_mesh(id, verts),
+        None => *slot = Some(stage.create_mesh(verts)),
+    }
 }
 
 enum Drag {
@@ -93,16 +146,23 @@ enum Drag {
 
 struct ModelApp {
     sender: AppSender<Message>,
-    /// Bumped by every open, so a slow load the user has moved past is
-    /// dropped when it arrives.
+    /// Bumped by every open, so a slow load (or overlay build) the user has
+    /// moved past is dropped when it arrives.
     generation: u64,
     loading: Option<PathBuf>,
     model: Option<Arc<Model>>,
     error: Option<String>,
+    /// The folder's models, for ←/→, and where the open one is among them.
+    files: Vec<PathBuf>,
+    file_at: usize,
+    overlays: Option<Overlays>,
+    building_overlays: bool,
+    show_grid: bool,
+    show_wire: bool,
+    show_normals: bool,
     camera: Camera,
     gpu: Option<Gpu>,
-    /// The model's vertices are not on the GPU yet.
-    upload_pending: bool,
+    pending: Pending,
     /// The view changed since the scene was last staged. A staged scene
     /// stays in the backdrop until the next one, so a frame that only
     /// changes the HUD does not redraw the model.
@@ -123,7 +183,12 @@ impl ModelApp {
         self.win.0 / self.win.1.max(1.0)
     }
 
-    fn open(&mut self, path: PathBuf) {
+    /// Read `path` on a worker. A file opened from outside the folder list
+    /// (the dialog, a drop, the command line) makes its folder the list.
+    fn open(&mut self, path: PathBuf, new_folder: bool) {
+        if new_folder {
+            (self.files, self.file_at) = files::siblings(&path);
+        }
         self.generation += 1;
         let generation = self.generation;
         self.loading = Some(path.clone());
@@ -151,8 +216,41 @@ impl ModelApp {
             ("PLY", &["ply"]),
         ];
         if let Some(path) = cce_ui::file_dialog::pick_file("Open model", filters) {
-            self.open(path);
+            self.open(path, true);
         }
+    }
+
+    /// The next (`step` 1) or previous (−1) model in the folder, wrapping.
+    fn step_file(&mut self, step: i64) {
+        if self.files.len() < 2 {
+            return;
+        }
+        let n = self.files.len() as i64;
+        self.file_at = (self.file_at as i64 + step).rem_euclid(n) as usize;
+        self.open(self.files[self.file_at].clone(), false);
+    }
+
+    /// Build the wireframe and normals on a worker, if they are wanted and
+    /// not built or being built.
+    fn want_overlays(&mut self) {
+        if !(self.show_wire || self.show_normals) || self.overlays.is_some() || self.building_overlays {
+            return;
+        }
+        let Some(model) = self.model.clone() else { return };
+        self.building_overlays = true;
+        let (generation, sender) = (self.generation, self.sender.clone());
+        std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let edges = Arc::new(overlay::edges(&model.mesh));
+            let normals = Arc::new(overlay::normals(&model.mesh, light::CREASE_DEGREES));
+            log::info!(
+                "[model] {} edges and {} normals in {:.0} ms",
+                edges.len() / 2,
+                normals.len() / 2,
+                started.elapsed().as_secs_f64() * 1e3
+            );
+            let _ = sender.send(Message::Overlays { generation, edges, normals });
+        });
     }
 
     fn frame_all(&mut self) {
@@ -178,14 +276,31 @@ impl ModelApp {
         (self.orbit_motion.x.pos(), self.orbit_motion.y.pos())
     }
 
-    fn hud_line(&self) -> Option<String> {
+    /// The HUD: the file (and its place in the folder), then what it holds.
+    fn hud_lines(&self) -> Vec<String> {
+        let place = if self.files.len() > 1 { format!("   ·   {} of {}", self.file_at + 1, self.files.len()) } else { String::new() };
         if let Some(path) = &self.loading {
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
-            return Some(format!("Loading {name}…"));
+            return vec![format!("Loading {name}…{place}")];
         }
-        let m = self.model.as_ref()?;
-        let parts = if m.parts > 1 { format!("   ·   {} parts", m.parts) } else { String::new() };
-        Some(format!("{}   ·   {} triangles{parts}", m.name, group_thousands(m.triangles)))
+        let Some(m) = &self.model else { return Vec::new() };
+        let mut facts = vec![
+            format!("{} triangles", group_thousands(m.mesh.triangles.len())),
+            format!("{} points", group_thousands(m.mesh.positions.len())),
+        ];
+        if m.parts > 1 {
+            facts.push(format!("{} parts", m.parts));
+        }
+        facts.push(units::dimensions(m.size, m.unit));
+        if self.show_grid {
+            facts.push(format!("grid {}", units::length(m.grid_step, m.unit)));
+        }
+        if self.building_overlays {
+            facts.push("building overlays…".into());
+        } else if self.show_wire && m.mesh.triangles.len() > overlay::MAX_WIRE_TRIANGLES {
+            facts.push(format!("no wireframe over {} triangles", group_thousands(overlay::MAX_WIRE_TRIANGLES)));
+        }
+        vec![format!("{}{place}", m.name), facts.join("   ·   ")]
     }
 }
 
@@ -229,9 +344,16 @@ impl Application for ModelApp {
             loading: None,
             model: None,
             error: None,
+            files: Vec::new(),
+            file_at: 0,
+            overlays: None,
+            building_overlays: false,
+            show_grid: true,
+            show_wire: false,
+            show_normals: false,
             camera: Camera::default(),
             gpu: None,
-            upload_pending: false,
+            pending: Pending::default(),
             scene_dirty: true,
             orbit_motion: ScrollMotion::new(),
             pointer: (0.0, 0.0),
@@ -242,7 +364,7 @@ impl Application for ModelApp {
             scale: 1.0,
         };
         if let Some(path) = std::env::args_os().nth(1) {
-            app.open(PathBuf::from(path));
+            app.open(PathBuf::from(path), true);
         }
         app
     }
@@ -265,10 +387,13 @@ impl Application for ModelApp {
                 self.loading = None;
                 match result {
                     Ok(model) => {
-                        log::info!("[model] {}: {} triangles", path.display(), model.triangles);
+                        log::info!("[model] {}: {} triangles", path.display(), model.mesh.triangles.len());
                         self.model = Some(model);
-                        self.upload_pending = true;
+                        self.overlays = None;
+                        self.building_overlays = false;
+                        self.pending = Pending { model: true, grid: true, edges: false, normals: false };
                         self.frame_all();
+                        self.want_overlays();
                     }
                     Err(e) => {
                         log::warn!("[model] {}: {e}", path.display());
@@ -276,6 +401,17 @@ impl Application for ModelApp {
                         self.error = Some(format!("{name}: {e}"));
                     }
                 }
+                *needs_rebuild = true;
+            }
+            Message::Overlays { generation, edges, normals } => {
+                if generation != self.generation {
+                    return;
+                }
+                self.building_overlays = false;
+                self.overlays = Some(Overlays { edges, normals });
+                self.pending.edges = true;
+                self.pending.normals = true;
+                self.scene_dirty = true;
                 *needs_rebuild = true;
             }
         }
@@ -300,7 +436,7 @@ impl Application for ModelApp {
     }
 
     /// Once per renderer, the first and any replacement after a reconnect:
-    /// a new renderer holds no meshes, so the model goes up again.
+    /// a new renderer holds no meshes, so everything goes up again.
     fn init_3d(&mut self, stage: &mut dyn Stage3D) {
         // Drawn as a `screen_space` draw: these corners are NDC, at the far
         // plane, untouched by the mvp; their z is ignored.
@@ -314,25 +450,37 @@ impl Application for ModelApp {
             bg(-1.0, 1.0, SKY_TOP),
         ]);
         stage.set_scene_light(light::KEY.normalize().to_array());
-        self.gpu = Some(Gpu { background, model: None });
-        self.upload_pending = self.model.is_some();
+        self.gpu = Some(Gpu { background, model: None, grid: None, edges: None, normals: None });
+        let has = self.model.is_some();
+        let built = self.overlays.is_some();
+        self.pending = Pending { model: has, grid: has, edges: built, normals: built };
         self.scene_dirty = true;
     }
 
     fn stage_3d(&mut self, stage: &mut dyn Stage3D, size: LogicalSize, scale: f64) -> bool {
         let Some(gpu) = self.gpu.as_mut() else { return false };
-        if self.upload_pending {
-            if let Some(m) = &self.model {
+        let pending = std::mem::take(&mut self.pending);
+        if let Some(m) = &self.model {
+            if pending.model {
                 // On the UI thread, unavoidably: the stage is only lent here.
                 // Logged, because it is the one part of a load the window waits on.
                 let started = std::time::Instant::now();
-                match gpu.model {
-                    Some(id) => stage.update_mesh(id, &m.verts),
-                    None => gpu.model = Some(stage.create_mesh(&m.verts)),
-                }
+                upload(stage, &mut gpu.model, &m.verts);
                 log::info!("[model] uploaded {} vertices in {:.0} ms", m.verts.len(), started.elapsed().as_secs_f64() * 1e3);
             }
-            self.upload_pending = false;
+            if pending.grid {
+                upload(stage, &mut gpu.grid, &m.grid);
+            }
+        }
+        if let Some(o) = &self.overlays {
+            if pending.edges {
+                upload(stage, &mut gpu.edges, &o.edges);
+            }
+            if pending.normals {
+                upload(stage, &mut gpu.normals, &o.normals);
+            }
+        }
+        if pending.model || pending.grid || pending.edges || pending.normals {
             self.scene_dirty = true;
         }
         if !std::mem::replace(&mut self.scene_dirty, false) {
@@ -340,9 +488,25 @@ impl Application for ModelApp {
         }
         let (pw, ph) = ((size.width as f64 * scale) as u32, (size.height as f64 * scale) as u32);
         let mvp = self.camera.view_proj(pw as f32 / ph.max(1) as f32).to_cols_array_2d();
+        // One logical px, whatever the output scale (clamped by the device).
+        let line_width = scale as f32;
+        let lines = |mesh| SceneDraw { wireframe: true, line_width, ..draw(mesh, mvp) };
         let mut draws = vec![SceneDraw { screen_space: true, ..draw(gpu.background, mvp) }];
-        if let (Some(id), Some(_)) = (gpu.model, &self.model) {
-            draws.push(SceneDraw { prelit: true, ..draw(id, mvp) });
+        if self.model.is_some() {
+            let wire = self.show_wire && self.overlays.is_some();
+            if let (true, Some(id)) = (self.show_grid, gpu.grid) {
+                draws.push(lines(id));
+            }
+            if let Some(id) = gpu.model {
+                let base = if wire { line_width } else { 0.0 };
+                draws.push(SceneDraw { prelit: true, wire_base_width: base, ..draw(id, mvp) });
+            }
+            if let (true, Some(id)) = (wire, gpu.edges) {
+                draws.push(SceneDraw { opacity: WIRE_OPACITY, ..lines(id) });
+            }
+            if let (true, true, Some(id)) = (self.show_normals, self.overlays.is_some(), gpu.normals) {
+                draws.push(lines(id));
+            }
         }
         stage.stage_scene((0, 0, pw, ph), draws);
         false
@@ -423,6 +587,28 @@ impl Application for ModelApp {
         true
     }
 
+    fn drop_mimes(&self) -> &'static [&'static str] {
+        &["text/uri-list"]
+    }
+
+    /// A file dragged in from cce-files (or anything that offers a uri
+    /// list): the first one the viewer reads opens, and its folder becomes
+    /// the ←/→ list.
+    fn handle_drop(&mut self, _mime: &str, data: &[u8], _pos: LogicalPosition, needs_rebuild: &mut bool) {
+        let paths = files::dropped_paths(data);
+        match paths.iter().find(|p| files::readable(p)) {
+            Some(p) => self.open(p.clone(), true),
+            None => {
+                let what = paths.first().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned());
+                self.error = Some(match what {
+                    Some(name) => format!("{name}: not a model this viewer reads"),
+                    None => "nothing to open in that drop".into(),
+                });
+            }
+        }
+        *needs_rebuild = true;
+    }
+
     fn handle_key_input(&mut self, event: &KeyEvent, needs_rebuild: &mut bool) -> Option<Message> {
         // Wheel and button events carry no modifiers, so track them from
         // the key stream (ctrl+wheel zoom, shift+drag pan).
@@ -440,9 +626,21 @@ impl Application for ModelApp {
         match &event.logical_key {
             Key::Character(c) if c == "o" => self.open_dialog(),
             Key::Character(c) if c == "0" => self.frame_all(),
+            Key::Character(c) if c == "g" => self.show_grid = !self.show_grid,
+            Key::Character(c) if c == "w" => {
+                self.show_wire = !self.show_wire;
+                self.want_overlays();
+            }
+            Key::Character(c) if c == "n" => {
+                self.show_normals = !self.show_normals;
+                self.want_overlays();
+            }
             Key::Character(c) if c == "q" => return Some(Message::Quit),
+            Key::Named(NamedKey::ArrowLeft) => self.step_file(-1),
+            Key::Named(NamedKey::ArrowRight) => self.step_file(1),
             _ => return None,
         }
+        self.scene_dirty = true;
         *needs_rebuild = true;
         None
     }
@@ -463,13 +661,23 @@ impl Application for ModelApp {
         if let Some(e) = &self.error {
             centre(&mut pc, e);
         } else if self.model.is_none() && self.loading.is_none() {
-            centre(&mut pc, "Press o to open a model (STL, OBJ, glTF or PLY)");
+            centre(&mut pc, "Press o to open a model (STL, OBJ, glTF or PLY), or drop one here");
         }
 
-        if let Some(hud) = self.hud_line() {
-            let w = 2.0 * text_in + hud.chars().count() as f32 * 6.6;
-            pc.quad(Rect { x: inset, y: inset, width: w, height: 24.0 }, [0.0, 0.0, 0.0, 0.45]);
-            pc.text(hud, inset + text_in, inset + 5.0, 12.0, [230, 230, 230]);
+        let lines = self.hud_lines();
+        if !lines.is_empty() {
+            const LINE: f32 = 18.0;
+            let longest = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+            let w = 2.0 * text_in + longest as f32 * 6.6;
+            let h = 8.0 + LINE * lines.len() as f32;
+            pc.quad(Rect { x: inset, y: inset, width: w, height: h }, [0.0, 0.0, 0.0, 0.45]);
+            for (i, line) in lines.into_iter().enumerate() {
+                let colour = if i == 0 { [235, 235, 238] } else { [190, 190, 198] };
+                pc.text(line, inset + text_in, inset + 5.0 + LINE * i as f32, 12.0, colour);
+            }
+        }
+        if self.model.is_some() {
+            pc.text(HINTS, inset, size.height - inset - 14.0, 11.0, [120, 122, 132]);
         }
         Some(pc.finish())
     }
