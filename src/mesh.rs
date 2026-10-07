@@ -67,11 +67,10 @@ impl Mesh {
     /// sit 1.7 times farther out than any of its points, and framing those
     /// left a framed sphere small in the window.
     ///
-    /// Not only for a tidy camera: cce-ui's scene pass reads any vertex
-    /// whose z is within 0.01 of 9.99 as a corner of the screen-space
-    /// background quad (`scene3d.wgsl`), whatever mesh it is in. A model
-    /// spanning z = 9.99 in its own units had a ring of its points flung
-    /// across the screen. Inside a unit sphere no point comes near it.
+    /// The camera frames the unit sphere, so every model opens the same way
+    /// whatever its file's units. (It was also a workaround until cce-ui
+    /// 38bcad1, when any vertex near z = 9.99 was drawn as a corner of the
+    /// screen-space background; that is a per-draw flag now.)
     pub fn fit_to_unit(&mut self) -> (Vec3, f32) {
         let Some((lo, hi)) = self.bounds() else { return (Vec3::ZERO, 1.0) };
         let centre = (lo + hi) / 2.0;

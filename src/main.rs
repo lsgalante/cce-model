@@ -193,6 +193,7 @@ fn draw(mesh: MeshId, mvp: [[f32; 4]; 4]) -> SceneDraw {
         prelit: false,
         see_through: false,
         instances: None,
+        screen_space: false,
     }
 }
 
@@ -279,9 +280,9 @@ impl Application for ModelApp {
     /// Once per renderer, the first and any replacement after a reconnect:
     /// a new renderer holds no meshes, so the model goes up again.
     fn init_3d(&mut self, stage: &mut dyn Stage3D) {
-        let bg = |x: f32, y: f32, color: [f32; 3]| Vertex3D { position: [x, y, 9.99], color };
-        // z = 9.99 is the scene pass's screen-space sentinel: these corners
-        // are NDC, drawn behind everything, untouched by the mvp.
+        // Drawn as a `screen_space` draw: these corners are NDC, at the far
+        // plane, untouched by the mvp; their z is ignored.
+        let bg = |x: f32, y: f32, color: [f32; 3]| Vertex3D { position: [x, y, 0.0], color };
         let background = stage.create_mesh(&[
             bg(-1.0, -1.0, SKY_BOTTOM),
             bg(1.0, -1.0, SKY_BOTTOM),
@@ -313,7 +314,7 @@ impl Application for ModelApp {
         }
         let (pw, ph) = ((size.width as f64 * scale) as u32, (size.height as f64 * scale) as u32);
         let mvp = self.camera.view_proj(pw as f32 / ph.max(1) as f32).to_cols_array_2d();
-        let mut draws = vec![draw(gpu.background, mvp)];
+        let mut draws = vec![SceneDraw { screen_space: true, ..draw(gpu.background, mvp) }];
         if let (Some(id), Some(_)) = (gpu.model, &self.model) {
             draws.push(SceneDraw { prelit: true, ..draw(id, mvp) });
         }
