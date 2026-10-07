@@ -9,23 +9,32 @@
 //! first time either is asked for, so a big model does not pay for them
 //! unless they are wanted.
 //!
+//! `r` swaps in a path-traced view (cce-ui's tracer): whenever the camera
+//! has been still for `STILL`, each frame adds a sample until the cap
+//! (`trace::SAMPLES_ON_MAINS`, fewer on battery), after which nothing more
+//! is staged and the GPU is left idle with the result on screen. Any
+//! camera move drops straight back to the raster view.
+//!
 //! Mouse: drag orbits, shift+drag or middle-drag pans, ctrl+wheel and pinch
 //! zoom, a two-finger scroll orbits (and coasts), as in cce-designer. A file
 //! dropped on the window opens. Keys: o open · ←/→ the folder's other models
-//! · 0 frame all · g grid · w wireframe · n normals · q quit.
+//! · 0 frame all · g grid · w wireframe · n normals · r traced · q quit.
 
 mod camera;
 mod files;
 mod light;
 mod overlay;
+mod trace;
 mod units;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use cce_mesh_io::{Mesh, Unit, UpAxis};
 use cce_ui::engine::{
-    AppSender, Application, LogicalPosition, LogicalSize, MeshId, SceneDraw, Stage3D, Vertex3D, WindowSettings,
+    AppSender, Application, LogicalPosition, LogicalSize, MeshId, RtCamera, RtMaterial, RtTriangle, SceneDraw, Stage3D,
+    Vertex3D, WindowSettings,
 };
 use cce_ui::scene::layout::Rect;
 use cce_ui::scene::paint::{DisplayList, PaintCtx};
@@ -47,7 +56,14 @@ const SKY_BOTTOM: [f32; 3] = [0.03, 0.03, 0.035];
 /// How strongly the wireframe shows over the model.
 const WIRE_OPACITY: f32 = 0.55;
 
-const HINTS: &str = "o open   ·   ←/→ folder   ·   0 frame   ·   g grid   ·   w wireframe   ·   n normals";
+const HINTS: &str =
+    "o open   ·   ←/→ folder   ·   0 frame   ·   g grid   ·   w wireframe   ·   n normals   ·   r traced";
+
+/// How long the camera must rest before the traced view takes over.
+const STILL: Duration = Duration::from_millis(150);
+
+/// Where the system lists its power supplies, for the battery check.
+const POWER_SUPPLIES: &str = "/sys/class/power_supply";
 
 #[derive(Debug, Clone)]
 enum Message {
@@ -56,6 +72,8 @@ enum Message {
     Loaded { generation: u64, path: PathBuf, result: Result<Arc<Model>, String> },
     /// The wireframe and the normals of the model of `generation`.
     Overlays { generation: u64, edges: Arc<Vec<Vertex3D>>, normals: Arc<Vec<Vertex3D>> },
+    /// The traced view's scene for the model of `generation`.
+    TraceScene { generation: u64, scene: Arc<TraceScene> },
     Quit,
 }
 
@@ -74,6 +92,15 @@ struct Model {
     verts: Vec<Vertex3D>,
     grid: Vec<Vertex3D>,
     grid_step: f32,
+    /// The grid's height in the fitted space: where the traced ground is.
+    floor_y: f32,
+}
+
+/// The tracer's triangles and materials, built on a worker.
+#[derive(Debug)]
+struct TraceScene {
+    triangles: Vec<RtTriangle>,
+    materials: Vec<RtMaterial>,
 }
 
 impl Model {
@@ -99,6 +126,7 @@ impl Model {
             mesh,
             grid: grid.lines,
             grid_step: grid.step,
+            floor_y: (lo.y - centre.y) / radius,
         })
     }
 }
@@ -160,6 +188,24 @@ struct ModelApp {
     show_grid: bool,
     show_wire: bool,
     show_normals: bool,
+    /// The path-traced view: asked for, its scene once built, whether the
+    /// current renderer holds it, and how far it has refined.
+    traced: bool,
+    trace_scene: Option<Arc<TraceScene>>,
+    building_trace: bool,
+    trace_uploaded: bool,
+    /// A frame saying "preparing" has gone out ahead of the upload, which
+    /// freezes the window while cce-ui builds the tracer's BVH (2.4 s for
+    /// 5M triangles), so the freeze is explained before it happens.
+    trace_announced: bool,
+    samples: u32,
+    sample_cap: u32,
+    /// The camera and pane last staged, and when they last changed: the
+    /// tracer waits for `STILL` after any change.
+    view_key: [u32; 8],
+    moved_at: Instant,
+    /// When the current refinement began, to log how long it took.
+    trace_began: Option<Instant>,
     camera: Camera,
     gpu: Option<Gpu>,
     pending: Pending,
@@ -253,6 +299,43 @@ impl ModelApp {
         });
     }
 
+    /// Build the tracer's scene on a worker, if the traced view is wanted
+    /// and it is not built or being built.
+    fn want_trace(&mut self) {
+        if !self.traced || self.trace_scene.is_some() || self.building_trace {
+            return;
+        }
+        let Some(model) = self.model.clone() else { return };
+        self.building_trace = true;
+        let (generation, sender) = (self.generation, self.sender.clone());
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            let (triangles, materials) = trace::scene(&model.mesh, model.floor_y);
+            log::info!(
+                "[model] trace scene: {} triangles, {} materials in {:.0} ms",
+                triangles.len(),
+                materials.len(),
+                started.elapsed().as_secs_f64() * 1e3
+            );
+            let _ = sender.send(Message::TraceScene { generation, scene: Arc::new(TraceScene { triangles, materials }) });
+        });
+    }
+
+    fn toggle_trace(&mut self) {
+        self.traced = !self.traced;
+        self.samples = 0;
+        self.trace_began = None;
+        // Asked once a toggle: a plug pulled mid-session takes effect at the
+        // next `r` or the next model.
+        self.sample_cap = if trace::on_battery(Path::new(POWER_SUPPLIES)) {
+            trace::SAMPLES_ON_BATTERY
+        } else {
+            trace::SAMPLES_ON_MAINS
+        };
+        self.want_trace();
+        self.scene_dirty = true;
+    }
+
     fn frame_all(&mut self) {
         if self.model.is_some() {
             self.camera.frame(Vec3::ZERO, 1.0, self.aspect());
@@ -295,6 +378,16 @@ impl ModelApp {
         if self.show_grid {
             facts.push(format!("grid {}", units::length(m.grid_step, m.unit)));
         }
+        if self.traced {
+            let battery = if self.sample_cap < trace::SAMPLES_ON_MAINS { " (battery)" } else { "" };
+            facts.push(if self.building_trace || (self.trace_scene.is_some() && !self.trace_uploaded) {
+                "traced: preparing…".into()
+            } else if self.samples >= self.sample_cap {
+                format!("traced, {} samples{battery}", self.samples)
+            } else {
+                format!("traced {} / {}{battery}", self.samples, self.sample_cap)
+            });
+        }
         if self.building_overlays {
             facts.push("building overlays…".into());
         } else if self.show_wire && m.mesh.triangles.len() > overlay::MAX_WIRE_TRIANGLES {
@@ -315,6 +408,11 @@ fn group_thousands(n: usize) -> String {
         out.push(c);
     }
     out
+}
+
+/// The camera and pane, as bits: any change restarts the tracer's wait.
+fn view_key(c: &Camera, pw: u32, ph: u32) -> [u32; 8] {
+    [c.yaw.to_bits(), c.pitch.to_bits(), c.distance.to_bits(), c.pivot.x.to_bits(), c.pivot.y.to_bits(), c.pivot.z.to_bits(), pw, ph]
 }
 
 /// A scene draw of `mesh` with every option at its plain default.
@@ -351,6 +449,16 @@ impl Application for ModelApp {
             show_grid: true,
             show_wire: false,
             show_normals: false,
+            traced: false,
+            trace_scene: None,
+            building_trace: false,
+            trace_uploaded: false,
+            trace_announced: false,
+            samples: 0,
+            sample_cap: trace::SAMPLES_ON_MAINS,
+            view_key: [0; 8],
+            moved_at: Instant::now(),
+            trace_began: None,
             camera: Camera::default(),
             gpu: None,
             pending: Pending::default(),
@@ -392,8 +500,14 @@ impl Application for ModelApp {
                         self.overlays = None;
                         self.building_overlays = false;
                         self.pending = Pending { model: true, grid: true, edges: false, normals: false };
+                        self.trace_scene = None;
+                        self.building_trace = false;
+                        self.trace_uploaded = false;
+                        self.trace_announced = false;
+                        self.samples = 0;
                         self.frame_all();
                         self.want_overlays();
+                        self.want_trace();
                     }
                     Err(e) => {
                         log::warn!("[model] {}: {e}", path.display());
@@ -401,6 +515,17 @@ impl Application for ModelApp {
                         self.error = Some(format!("{name}: {e}"));
                     }
                 }
+                *needs_rebuild = true;
+            }
+            Message::TraceScene { generation, scene } => {
+                if generation != self.generation {
+                    return;
+                }
+                self.building_trace = false;
+                self.trace_scene = Some(scene);
+                self.trace_uploaded = false;
+                self.trace_announced = false;
+                self.samples = 0;
                 *needs_rebuild = true;
             }
             Message::Overlays { generation, edges, normals } => {
@@ -454,6 +579,10 @@ impl Application for ModelApp {
         let has = self.model.is_some();
         let built = self.overlays.is_some();
         self.pending = Pending { model: has, grid: has, edges: built, normals: built };
+        // The tracer's scene and its accumulation died with the old renderer.
+        self.trace_uploaded = false;
+        self.trace_announced = false;
+        self.samples = 0;
         self.scene_dirty = true;
     }
 
@@ -483,11 +612,56 @@ impl Application for ModelApp {
         if pending.model || pending.grid || pending.edges || pending.normals {
             self.scene_dirty = true;
         }
-        if !std::mem::replace(&mut self.scene_dirty, false) {
-            return false;
-        }
         let (pw, ph) = ((size.width as f64 * scale) as u32, (size.height as f64 * scale) as u32);
-        let mvp = self.camera.view_proj(pw as f32 / ph.max(1) as f32).to_cols_array_2d();
+        let view_proj = self.camera.view_proj(pw as f32 / ph.max(1) as f32);
+
+        // The traced view: once the camera has rested, a sample a frame up
+        // to the cap; then nothing, and the backdrop keeps the image.
+        let key = view_key(&self.camera, pw, ph);
+        if key != self.view_key {
+            self.view_key = key;
+            self.moved_at = Instant::now();
+            self.samples = 0;
+            self.trace_began = None;
+        }
+        let tracing = self.traced && self.model.is_some() && self.trace_scene.is_some();
+        if tracing && self.moved_at.elapsed() >= STILL {
+            if self.samples >= self.sample_cap {
+                return false;
+            }
+            if !self.trace_uploaded {
+                // The HUD is painted before this runs: return once so the
+                // frame saying "preparing" is presented, and upload on the
+                // next.
+                if !std::mem::replace(&mut self.trace_announced, true) {
+                    return true;
+                }
+                let scene = self.trace_scene.as_ref().unwrap();
+                let started = Instant::now();
+                stage.set_rt_scene(&scene.triangles, &scene.materials);
+                stage.set_rt_environment(trace::environment(light::KEY.normalize().to_array()));
+                stage.set_rt_background(Some(trace::BACKGROUND));
+                log::info!("[model] trace scene uploaded in {:.0} ms", started.elapsed().as_secs_f64() * 1e3);
+                self.trace_uploaded = true;
+            }
+            let began = *self.trace_began.get_or_insert_with(Instant::now);
+            stage.stage_rt((0, 0, pw, ph), RtCamera { inv_mvp: view_proj.inverse().to_cols_array_2d() });
+            self.samples += 1;
+            // Whatever is staged next (a move's raster frame) must restage.
+            self.scene_dirty = true;
+            if self.samples == self.sample_cap {
+                log::info!("[model] traced {} samples in {:.0} ms; idle", self.samples, began.elapsed().as_secs_f64() * 1e3);
+            }
+            // One frame more than samples: the HUD is painted before this
+            // runs, so the frame after the last sample is the one that says
+            // the cap was reached; that frame stages nothing (above).
+            return true;
+        }
+        if !std::mem::replace(&mut self.scene_dirty, false) {
+            // Still waiting out STILL: keep the frames coming to notice it.
+            return tracing;
+        }
+        let mvp = view_proj.to_cols_array_2d();
         // One logical px, whatever the output scale (clamped by the device).
         let line_width = scale as f32;
         let lines = |mesh| SceneDraw { wireframe: true, line_width, ..draw(mesh, mvp) };
@@ -509,7 +683,7 @@ impl Application for ModelApp {
             }
         }
         stage.stage_scene((0, 0, pw, ph), draws);
-        false
+        tracing
     }
 
     fn handle_resize(&mut self, width: f32, height: f32, scale: f64) {
@@ -635,6 +809,7 @@ impl Application for ModelApp {
                 self.show_normals = !self.show_normals;
                 self.want_overlays();
             }
+            Key::Character(c) if c == "r" => self.toggle_trace(),
             Key::Character(c) if c == "q" => return Some(Message::Quit),
             Key::Named(NamedKey::ArrowLeft) => self.step_file(-1),
             Key::Named(NamedKey::ArrowRight) => self.step_file(1),

@@ -5,9 +5,10 @@ A viewer for 3D model files. Read the workspace guide
 particular to this crate. The plan it is built to — formats, milestones,
 what each one must pass — is the design doc "cce-model: a general-purpose
 3D viewer" (claude.ai/code/artifact/1ebec744-8990-4884-ad92-73c72e0ea265).
-Milestones 1–3 are here: STL, OBJ, glTF/GLB and PLY read by the shared
+Milestones 1–4 are here: STL, OBJ, glTF/GLB and PLY read by the shared
 `cce-mesh-io` crate, a grid floor, wireframe and normals overlays, sizes in
-the file's units, ←/→ through the folder and drag-and-drop.
+the file's units, ←/→ through the folder, drag-and-drop, and a path-traced
+view (`r`).
 
 ## Shape
 
@@ -32,6 +33,10 @@ the file's units, ←/→ through the folder and drag-and-drop.
   (`Message::Overlays`, tied to the load's generation). No wireframe past
   `MAX_WIRE_TRIANGLES` (2M): it paints the model solid and costs 360 MB;
   normals are thinned to `MAX_NORMALS` and drawn as long as their spacing.
+- `src/trace.rs` — the traced view's scene (a material per distinct
+  triangle colour, quantized; a wide ground plane at the grid's height), its
+  grey sky with the sun on the raster key light, the sample caps (256 on
+  mains, 32 on battery) and the `/sys/class/power_supply` battery check.
 - `src/units.rs` — sizes in mm/m only when the format says what its unit
   is (`cce_mesh_io::Unit`); OBJ and PLY sizes are bare numbers.
 - `src/files.rs` — the folder's models for ←/→ (any file opened from
@@ -60,6 +65,19 @@ the file's units, ←/→ through the folder and drag-and-drop.
   slots and marks every CPU-side list pending for a replacement renderer.
 - **The clip planes keep 3 radii** around the pivot, for the grid's
   corners, not just the model's 1.
+- **The traced view is a state machine in `stage_3d`.** Any change of
+  camera or pane (`view_key`) resets the samples and the wait; only after
+  `STILL` (150 ms) does a frame stage `stage_rt` instead of the raster
+  scene, one sample a frame; at the cap it stages nothing and stops asking
+  for frames, so the GPU and the process go idle (0 CPU ticks measured)
+  with the traced image left in the backdrop. One frame past each edge is
+  deliberate: the HUD paints BEFORE `stage_3d`, so the cap and the
+  "preparing" notice each need a frame of their own to be seen.
+- **`set_rt_scene` builds the BVH on the UI thread** (the stage is only
+  lent there): 2.3 s for 5M triangles on the shadow's iGPU. The window says
+  "traced: preparing…" first; moving it off-thread needs cce-ui.
+- **The tracer has no smooth normals**: a coarse sphere shows its facets
+  when traced. Milestone 5's territory (cce-ui's materials and vertices).
 - No root plate, on purpose (`style-audit: opt-out` in `display_list`): the
   scene is the window's content, and a root plate would frost over it.
 
@@ -80,7 +98,8 @@ then `ctl windows` for the id and `shot-window <id>`. The window is
 640×360. `pointer-press` / `pointer-move-by` / `pointer-release` drive an
 orbit, `pointer-pinch 1.6` a zoom, `pointer-scroll 0 -12 finger` then
 `pointer-scroll finger-stop` a scroll orbit and its coast, `keypress 11` the
-`0` key, 17/49/34 `w`/`n`/`g`, 105/106 ←/→. A new viewer window can map
+`0` key, 17/49/34/19 `w`/`n`/`g`/`r`, 105/106 ←/→. A traced run logs
+`traced N samples in M ms; idle` at its cap. A new viewer window can map
 WITHOUT focus (keys then reach nothing, or a stale window): `ctl
 focus-window cce-model` after each launch, and close windows by pid
 (checking `/proc/<pid>/environ` for the shadow's display) — one launched by
