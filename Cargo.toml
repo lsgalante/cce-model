@@ -1,0 +1,10 @@
+[package]
+name = "cce-model"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+cce-ui = { git = "https://github.com/lsgalante/cce-ui.git", rev = "13700f16b074b27da794ea57b17867d48ff80d2c" }
+glam = "0.29"
+log = "0.4"
+env_logger = "0.11"

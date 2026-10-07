@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Model
+GenericName=3D Model Viewer
+Comment=View STL and OBJ models
+Exec=cce-model %f
+Icon=cce-model
+Terminal=false
+Categories=Graphics;3DGraphics;Viewer;
+MimeType=model/stl;application/sla;model/obj;
+NoDisplay=false
