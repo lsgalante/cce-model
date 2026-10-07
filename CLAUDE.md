@@ -73,9 +73,17 @@ view (`r`).
   with the traced image left in the backdrop. One frame past each edge is
   deliberate: the HUD paints BEFORE `stage_3d`, so the cap and the
   "preparing" notice each need a frame of their own to be seen.
-- **`set_rt_scene` builds the BVH on the UI thread** (the stage is only
-  lent there): 2.3 s for 5M triangles on the shadow's iGPU. The window says
-  "traced: preparing…" first; moving it off-thread needs cce-ui.
+- **The tracer's BVH is built on the worker**, with the rest of the scene
+  (`PreparedRtScene::new` in `want_trace`, cce-ui ≥ e5fbe9a); `stage_3d`
+  only uploads it (`set_rt_scene_prepared`). Whether to build one is the
+  stage's `rt_needs_bvh()`, asked in `init_3d`: the hardware ray-query tier
+  builds its own structure on the GPU and skips it. Measured 2026-10-07,
+  torus5m.stl (5,001,600 triangles), scale-2 shadow: Intel iGPU (compute
+  tier) worker 2032 ms, UI thread 61 ms (it was 2141 ms on the UI thread);
+  RTX 4080 (ray-query, `CCE_VK_DEVICE=discrete` plus the live `DISPLAY=:0`
+  in the shadow) worker 321 ms, upload with the BLAS build 146 ms. The
+  prepared scene stays in memory for a reconnect's re-upload (~300 MB at
+  5M with its BVH, on top of the baked vertices).
 - **The tracer has no smooth normals**: a coarse sphere shows its facets
   when traced. Milestone 5's territory (cce-ui's materials and vertices).
 - No root plate, on purpose (`style-audit: opt-out` in `display_list`): the

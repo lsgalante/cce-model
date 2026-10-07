@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 
 use cce_mesh_io::{Mesh, Unit, UpAxis};
 use cce_ui::engine::{
-    AppSender, Application, LogicalPosition, LogicalSize, MeshId, RtCamera, RtMaterial, RtTriangle, SceneDraw, Stage3D,
+    AppSender, Application, LogicalPosition, LogicalSize, MeshId, PreparedRtScene, RtCamera, SceneDraw, Stage3D,
     Vertex3D, WindowSettings,
 };
 use cce_ui::scene::layout::Rect;
@@ -73,7 +73,7 @@ enum Message {
     /// The wireframe and the normals of the model of `generation`.
     Overlays { generation: u64, edges: Arc<Vec<Vertex3D>>, normals: Arc<Vec<Vertex3D>> },
     /// The traced view's scene for the model of `generation`.
-    TraceScene { generation: u64, scene: Arc<TraceScene> },
+    TraceScene { generation: u64, scene: Arc<PreparedRtScene> },
     Quit,
 }
 
@@ -94,13 +94,6 @@ struct Model {
     grid_step: f32,
     /// The grid's height in the fitted space: where the traced ground is.
     floor_y: f32,
-}
-
-/// The tracer's triangles and materials, built on a worker.
-#[derive(Debug)]
-struct TraceScene {
-    triangles: Vec<RtTriangle>,
-    materials: Vec<RtMaterial>,
 }
 
 impl Model {
@@ -191,12 +184,18 @@ struct ModelApp {
     /// The path-traced view: asked for, its scene once built, whether the
     /// current renderer holds it, and how far it has refined.
     traced: bool,
-    trace_scene: Option<Arc<TraceScene>>,
+    /// Built on a worker — packed, and its BVH built when the renderer's
+    /// tracer wants one — so the UI thread only uploads it.
+    trace_scene: Option<Arc<PreparedRtScene>>,
+    /// Whether the renderer's tracer traverses a CPU-built BVH (asked in
+    /// `init_3d`): the worker builds one only then.
+    rt_needs_bvh: bool,
     building_trace: bool,
     trace_uploaded: bool,
-    /// A frame saying "preparing" has gone out ahead of the upload, which
-    /// freezes the window while cce-ui builds the tracer's BVH (2.4 s for
-    /// 5M triangles), so the freeze is explained before it happens.
+    /// A frame saying "preparing" has gone out ahead of the upload. The BVH
+    /// is the worker's now, so the upload is short (61 ms for 5M triangles
+    /// on the iGPU, against 2.1 s when it built the BVH too), but the first
+    /// one also makes the tracer's pipelines.
     trace_announced: bool,
     samples: u32,
     sample_cap: u32,
@@ -307,17 +306,20 @@ impl ModelApp {
         }
         let Some(model) = self.model.clone() else { return };
         self.building_trace = true;
-        let (generation, sender) = (self.generation, self.sender.clone());
+        let (generation, sender, with_bvh) = (self.generation, self.sender.clone(), self.rt_needs_bvh);
         std::thread::spawn(move || {
             let started = Instant::now();
             let (triangles, materials) = trace::scene(&model.mesh, model.floor_y);
+            let n_materials = materials.len();
+            let scene = PreparedRtScene::new(triangles, &materials, None, with_bvh);
             log::info!(
-                "[model] trace scene: {} triangles, {} materials in {:.0} ms",
-                triangles.len(),
-                materials.len(),
+                "[model] trace scene: {} triangles, {} materials{} in {:.0} ms",
+                scene.triangle_count(),
+                n_materials,
+                if with_bvh { ", BVH" } else { "" },
                 started.elapsed().as_secs_f64() * 1e3
             );
-            let _ = sender.send(Message::TraceScene { generation, scene: Arc::new(TraceScene { triangles, materials }) });
+            let _ = sender.send(Message::TraceScene { generation, scene: Arc::new(scene) });
         });
     }
 
@@ -451,6 +453,7 @@ impl Application for ModelApp {
             show_normals: false,
             traced: false,
             trace_scene: None,
+            rt_needs_bvh: true,
             building_trace: false,
             trace_uploaded: false,
             trace_announced: false,
@@ -575,6 +578,7 @@ impl Application for ModelApp {
             bg(-1.0, 1.0, SKY_TOP),
         ]);
         stage.set_scene_light(light::KEY.normalize().to_array());
+        self.rt_needs_bvh = stage.rt_needs_bvh();
         self.gpu = Some(Gpu { background, model: None, grid: None, edges: None, normals: None });
         let has = self.model.is_some();
         let built = self.overlays.is_some();
@@ -636,9 +640,8 @@ impl Application for ModelApp {
                 if !std::mem::replace(&mut self.trace_announced, true) {
                     return true;
                 }
-                let scene = self.trace_scene.as_ref().unwrap();
                 let started = Instant::now();
-                stage.set_rt_scene(&scene.triangles, &scene.materials);
+                stage.set_rt_scene_prepared(self.trace_scene.as_ref().unwrap());
                 stage.set_rt_environment(trace::environment(light::KEY.normalize().to_array()));
                 stage.set_rt_background(Some(trace::BACKGROUND));
                 log::info!("[model] trace scene uploaded in {:.0} ms", started.elapsed().as_secs_f64() * 1e3);
