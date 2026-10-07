@@ -2,10 +2,10 @@
 Type=Application
 Name=Model
 GenericName=3D Model Viewer
-Comment=View STL and OBJ models
+Comment=View STL, OBJ, glTF and PLY models
 Exec=cce-model %f
 Icon=cce-model
 Terminal=false
 Categories=Graphics;3DGraphics;Viewer;
-MimeType=model/stl;application/sla;model/obj;
+MimeType=model/stl;model/x.stl-ascii;model/x.stl-binary;application/sla;model/obj;model/gltf+json;model/gltf-binary;
 NoDisplay=false

@@ -1,9 +1,9 @@
 //! cce-model — a viewer for 3D model files.
 //!
-//! Opens STL and OBJ (milestone 1 of the design doc; glTF and PLY follow),
-//! frames the model in a three-quarter view and lets you turn it. Files are
-//! read and lit on a worker thread (`load` + `mesh::bake`), then uploaded
-//! once and drawn through cce-ui's scene pass as one prelit mesh under a
+//! Opens STL, OBJ, glTF/GLB and PLY (read by cce-mesh-io), frames the model
+//! in a three-quarter view and lets you turn it. Files are read and lit on a
+//! worker thread (`cce_mesh_io::load` + `light::bake`), then uploaded once
+//! and drawn through cce-ui's scene pass as one prelit mesh under a
 //! screen-space background gradient. The whole window is the scene.
 //!
 //! Mouse: drag orbits, shift+drag or middle-drag pans, ctrl+wheel and pinch
@@ -11,8 +11,7 @@
 //! Keys: o open · 0 frame all · q quit.
 
 mod camera;
-mod load;
-mod mesh;
+mod light;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -27,6 +26,7 @@ use cce_ui::widget::{ElementState, Key, KeyEvent, MouseButton, MouseScrollDelta,
 use glam::Vec3;
 
 use camera::Camera;
+use cce_mesh_io::UpAxis;
 
 /// Wheel notches in logical px of orbit, and of log-zoom.
 const ORBIT_PX_PER_LINE: f32 = 10.0;
@@ -50,6 +50,8 @@ enum Message {
 struct Model {
     name: String,
     triangles: usize,
+    /// How many named pieces the file holds (glTF nodes; 1 for the rest).
+    parts: usize,
     /// Kept after upload: a replacement renderer (a reconnect) starts with
     /// no meshes, and this is what goes back up.
     verts: Vec<Vertex3D>,
@@ -57,14 +59,21 @@ struct Model {
 
 impl Model {
     fn read(path: &Path) -> Result<Model, String> {
-        let mut mesh = load::load(path)?;
-        // Every model is drawn inside the unit sphere (see `fit_to_unit`),
-        // so the camera frames that sphere whatever the file's units.
+        let scene = cce_mesh_io::load(path)?;
+        let mut mesh = scene.merged();
+        // STL is Z-up by convention; the view is Y-up. Turned here, not by
+        // the reader, which reports the file as it is.
+        if scene.up == UpAxis::Z {
+            mesh.z_up_to_y_up();
+        }
+        // Every model is drawn inside the unit sphere, so the camera frames
+        // that sphere whatever the file's units.
         mesh.fit_to_unit();
         Ok(Model {
             name: path.file_name().and_then(|n| n.to_str()).unwrap_or("?").to_string(),
             triangles: mesh.triangles.len(),
-            verts: mesh.bake(),
+            parts: scene.parts.len(),
+            verts: light::bake(&mesh),
         })
     }
 }
@@ -121,14 +130,26 @@ impl ModelApp {
         self.error = None;
         let sender = self.sender.clone();
         std::thread::spawn(move || {
-            let result = Model::read(&path).map(Arc::new);
+            // A reader that panics on a malformed file must not leave the
+            // window saying "Loading…" for ever: the panic becomes the error.
+            let started = std::time::Instant::now();
+            let result = std::panic::catch_unwind(|| Model::read(&path))
+                .unwrap_or_else(|_| Err("the reader crashed on this file".to_string()))
+                .map(Arc::new);
+            log::info!("[model] read and lit in {:.0} ms", started.elapsed().as_secs_f64() * 1e3);
             // Fails only once the app has gone, when nobody wants the model.
             let _ = sender.send(Message::Loaded { generation, path, result });
         });
     }
 
     fn open_dialog(&mut self) {
-        let filters: &[(&str, &[&str])] = &[("3D models", load::EXTENSIONS), ("STL", &["stl"]), ("OBJ", &["obj"])];
+        let filters: &[(&str, &[&str])] = &[
+            ("3D models", cce_mesh_io::EXTENSIONS),
+            ("STL", &["stl"]),
+            ("OBJ", &["obj"]),
+            ("glTF", &["gltf", "glb"]),
+            ("PLY", &["ply"]),
+        ];
         if let Some(path) = cce_ui::file_dialog::pick_file("Open model", filters) {
             self.open(path);
         }
@@ -163,7 +184,8 @@ impl ModelApp {
             return Some(format!("Loading {name}…"));
         }
         let m = self.model.as_ref()?;
-        Some(format!("{}   ·   {} triangles", m.name, group_thousands(m.triangles)))
+        let parts = if m.parts > 1 { format!("   ·   {} parts", m.parts) } else { String::new() };
+        Some(format!("{}   ·   {} triangles{parts}", m.name, group_thousands(m.triangles)))
     }
 }
 
@@ -291,7 +313,7 @@ impl Application for ModelApp {
             bg(1.0, 1.0, SKY_TOP),
             bg(-1.0, 1.0, SKY_TOP),
         ]);
-        stage.set_scene_light(mesh::KEY.normalize().to_array());
+        stage.set_scene_light(light::KEY.normalize().to_array());
         self.gpu = Some(Gpu { background, model: None });
         self.upload_pending = self.model.is_some();
         self.scene_dirty = true;
@@ -301,10 +323,14 @@ impl Application for ModelApp {
         let Some(gpu) = self.gpu.as_mut() else { return false };
         if self.upload_pending {
             if let Some(m) = &self.model {
+                // On the UI thread, unavoidably: the stage is only lent here.
+                // Logged, because it is the one part of a load the window waits on.
+                let started = std::time::Instant::now();
                 match gpu.model {
                     Some(id) => stage.update_mesh(id, &m.verts),
                     None => gpu.model = Some(stage.create_mesh(&m.verts)),
                 }
+                log::info!("[model] uploaded {} vertices in {:.0} ms", m.verts.len(), started.elapsed().as_secs_f64() * 1e3);
             }
             self.upload_pending = false;
             self.scene_dirty = true;
@@ -437,7 +463,7 @@ impl Application for ModelApp {
         if let Some(e) = &self.error {
             centre(&mut pc, e);
         } else if self.model.is_none() && self.loading.is_none() {
-            centre(&mut pc, "Press o to open a model (STL or OBJ)");
+            centre(&mut pc, "Press o to open a model (STL, OBJ, glTF or PLY)");
         }
 
         if let Some(hud) = self.hud_line() {
@@ -467,18 +493,5 @@ mod tests {
         assert_eq!(group_thousands(7), "7");
         assert_eq!(group_thousands(1000), "1,000");
         assert_eq!(group_thousands(1234567), "1,234,567");
-    }
-
-    #[test]
-    fn a_soup_cube_bakes_to_twelve_lit_triangles() {
-        let mut m = mesh::soup_cube();
-        m.weld();
-        let verts = m.bake();
-        assert_eq!(verts.len(), 36);
-        // Six faces, each one flat colour from its own normal: six distinct shades.
-        let mut shades: Vec<u32> = verts.iter().map(|v| (v.color[0] * 1e4) as u32).collect();
-        shades.sort();
-        shades.dedup();
-        assert_eq!(shades.len(), 6, "{shades:?}");
     }
 }
