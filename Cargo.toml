@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-cce-ui = { git = "https://github.com/lsgalante/cce-ui.git", rev = "d704c8ba87b36e6c2773dc4835020e5e4bef3f15" }
+cce-ui = { git = "https://github.com/lsgalante/cce-ui.git", rev = "dbc3e3ec1f921a7c351dfd445905bc59b999388d" }
 cce-mesh-io = { git = "https://github.com/lsgalante/cce-mesh-io.git", rev = "02e0b6fbcc30e92566522bb55c8e2ce18aed65ec" }
 glam = "0.29"
 log = "0.4"
