@@ -416,16 +416,6 @@ dependencies = [
 [[package]]
 name = "cce-core"
 version = "0.1.0"
-source = "git+https://github.com/lsgalante/cce-core.git?rev=0adfe0bb400d4ac7e85f4ab36145dda3f346fcd4#0adfe0bb400d4ac7e85f4ab36145dda3f346fcd4"
-dependencies = [
- "libc",
- "log",
- "web-time",
-]
-
-[[package]]
-name = "cce-core"
-version = "0.1.0"
 source = "git+https://github.com/lsgalante/cce-core.git?rev=27a2567b217312898a5de44ce430533d9870b4e4#27a2567b217312898a5de44ce430533d9870b4e4"
 dependencies = [
  "fluent-bundle",
@@ -438,12 +428,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "cce-core"
+version = "0.1.0"
+source = "git+https://github.com/lsgalante/cce-core.git?rev=6a542c18ee31a20cfa3ecaa9da71ffa1d995af04#6a542c18ee31a20cfa3ecaa9da71ffa1d995af04"
+dependencies = [
+ "libc",
+ "log",
+ "web-time",
+]
+
+[[package]]
 name = "cce-mesh-io"
 version = "0.1.0"
-source = "git+https://github.com/lsgalante/cce-mesh-io.git?rev=b14608d51e380ba41b5fb15f766fcd73beb69cf9#b14608d51e380ba41b5fb15f766fcd73beb69cf9"
+source = "git+https://github.com/lsgalante/cce-mesh-io.git?rev=c8a0ffdbb664ff1bcc42a8634bd37489b20ee5ce#c8a0ffdbb664ff1bcc42a8634bd37489b20ee5ce"
 dependencies = [
  "base64",
- "cce-core 0.1.0 (git+https://github.com/lsgalante/cce-core.git?rev=0adfe0bb400d4ac7e85f4ab36145dda3f346fcd4)",
+ "cce-core 0.1.0 (git+https://github.com/lsgalante/cce-core.git?rev=6a542c18ee31a20cfa3ecaa9da71ffa1d995af04)",
  "glam",
  "gltf",
  "image",
