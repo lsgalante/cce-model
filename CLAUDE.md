@@ -13,9 +13,9 @@ light, metallic-roughness, base-colour textures).
 
 ## Shape
 
-- `src/main.rs` — the `Application`. Portable hooks only: `create`,
-  `init_3d` / `stage_3d` (never the native `renderer_init` /
-  `stage_renderer`). A file is read on a worker thread and comes back through
+- `src/main.rs` — the `Application`. Portable hooks only: `create`, and
+  `App3D`'s `init_3d` / `stage_3d` (reached through `Application::app_3d`;
+  never the native `renderer_init` / `stage_renderer`). A file is read on a worker thread and comes back through
   the `AppSender` as an `Arc<Model>` (the runner clones messages); a
   generation drops a load the user has moved past, and a reader's panic is
   caught there and shown as an error. The model's baked vertices stay on

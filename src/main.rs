@@ -465,6 +465,10 @@ fn draw(mesh: MeshId, mvp: [[f32; 4]; 4]) -> SceneDraw {
 impl Application for ModelApp {
     type Message = Message;
 
+    fn app_3d(&mut self) -> Option<&mut dyn cce_ui::engine::App3D> {
+        Some(self)
+    }
+
     fn create(sender: AppSender<Message>) -> Self {
         let mut app = Self {
             sender,
@@ -598,166 +602,6 @@ impl Application for ModelApp {
 
     fn display_list_text(&self) -> bool {
         true
-    }
-
-    /// Once per renderer, the first and any replacement after a reconnect:
-    /// a new renderer holds no meshes, so everything goes up again.
-    fn init_3d(&mut self, stage: &mut dyn Stage3D) {
-        // Drawn as a `screen_space` draw: these corners are NDC, at the far
-        // plane, untouched by the mvp; their z is ignored.
-        let bg = |x: f32, y: f32, color: [f32; 3]| Vertex3D { position: [x, y, 0.0], color };
-        let background = stage.create_mesh(&[
-            bg(-1.0, -1.0, SKY_BOTTOM),
-            bg(1.0, -1.0, SKY_BOTTOM),
-            bg(1.0, 1.0, SKY_TOP),
-            bg(-1.0, -1.0, SKY_BOTTOM),
-            bg(1.0, 1.0, SKY_TOP),
-            bg(-1.0, 1.0, SKY_TOP),
-        ]);
-        stage.set_scene_light(light::KEY.normalize().to_array());
-        self.rt_needs_bvh = stage.rt_needs_bvh();
-        match stage.lit() {
-            Some(lit) => lit.set_lit_light(light::rig()),
-            None => self.error = Some("this renderer has no lit pipeline; nothing can be drawn".into()),
-        }
-        // A replacement renderer: the images went with the old one.
-        if std::mem::replace(&mut self.seen_renderer, true) {
-            self.upload_textures();
-        }
-        self.gpu = Some(Gpu { background, model: Vec::new(), model_parts: 0, grid: None, edges: None, normals: None });
-        let has = self.model.is_some();
-        let built = self.overlays.is_some();
-        self.pending = Pending { model: has, grid: has, edges: built, normals: built };
-        // The tracer's scene and its accumulation died with the old renderer.
-        self.trace_uploaded = false;
-        self.trace_announced = false;
-        self.samples = 0;
-        self.scene_dirty = true;
-    }
-
-    fn stage_3d(&mut self, stage: &mut dyn Stage3D, size: LogicalSize, scale: f64) -> bool {
-        let Some(gpu) = self.gpu.as_mut() else { return false };
-        let pending = std::mem::take(&mut self.pending);
-        if let Some(m) = &self.model {
-            if let (true, Some(lit)) = (pending.model, stage.lit()) {
-                // On the UI thread, unavoidably: the stage is only lent here.
-                // Logged, because it is the one part of a load the window waits on.
-                let started = std::time::Instant::now();
-                for (i, part) in m.surfaces.iter().enumerate() {
-                    match gpu.model.get(i) {
-                        Some(&id) => lit.update_lit_mesh(id, &part.verts),
-                        None => gpu.model.push(lit.create_lit_mesh(&part.verts)),
-                    }
-                }
-                gpu.model_parts = m.surfaces.len();
-                let count: usize = m.surfaces.iter().map(|p| p.verts.len()).sum();
-                log::info!("[model] uploaded {count} vertices in {:.0} ms", started.elapsed().as_secs_f64() * 1e3);
-            }
-            if pending.grid {
-                upload(stage, &mut gpu.grid, &m.grid);
-            }
-        }
-        if let Some(o) = &self.overlays {
-            if pending.edges {
-                upload(stage, &mut gpu.edges, &o.edges);
-            }
-            if pending.normals {
-                upload(stage, &mut gpu.normals, &o.normals);
-            }
-        }
-        if pending.model || pending.grid || pending.edges || pending.normals {
-            self.scene_dirty = true;
-        }
-        let (pw, ph) = ((size.width as f64 * scale) as u32, (size.height as f64 * scale) as u32);
-        let view_proj = self.camera.view_proj(pw as f32 / ph.max(1) as f32);
-
-        // The traced view: once the camera has rested, a sample a frame up
-        // to the cap; then nothing, and the backdrop keeps the image.
-        let key = view_key(&self.camera, pw, ph);
-        if key != self.view_key {
-            self.view_key = key;
-            self.moved_at = Instant::now();
-            self.samples = 0;
-            self.trace_began = None;
-        }
-        let tracing = self.traced && self.model.is_some() && self.trace_scene.is_some();
-        if tracing && self.moved_at.elapsed() >= STILL {
-            if self.samples >= self.sample_cap {
-                return false;
-            }
-            if !self.trace_uploaded {
-                // The HUD is painted before this runs: return once so the
-                // frame saying "preparing" is presented, and upload on the
-                // next.
-                if !std::mem::replace(&mut self.trace_announced, true) {
-                    return true;
-                }
-                let started = Instant::now();
-                stage.set_rt_scene_prepared(self.trace_scene.as_ref().unwrap());
-                stage.set_rt_environment(trace::environment(light::KEY.normalize().to_array()));
-                stage.set_rt_background(Some(trace::BACKGROUND));
-                log::info!("[model] trace scene uploaded in {:.0} ms", started.elapsed().as_secs_f64() * 1e3);
-                self.trace_uploaded = true;
-            }
-            let began = *self.trace_began.get_or_insert_with(Instant::now);
-            stage.stage_rt((0, 0, pw, ph), RtCamera { inv_mvp: view_proj.inverse().to_cols_array_2d() });
-            self.samples += 1;
-            // Whatever is staged next (a move's raster frame) must restage.
-            self.scene_dirty = true;
-            if self.samples == self.sample_cap {
-                log::info!("[model] traced {} samples in {:.0} ms; idle", self.samples, began.elapsed().as_secs_f64() * 1e3);
-            }
-            // One frame more than samples: the HUD is painted before this
-            // runs, so the frame after the last sample is the one that says
-            // the cap was reached; that frame stages nothing (above).
-            return true;
-        }
-        if !std::mem::replace(&mut self.scene_dirty, false) {
-            // Still waiting out STILL: keep the frames coming to notice it.
-            return tracing;
-        }
-        let mvp = view_proj.to_cols_array_2d();
-        // One logical px, whatever the output scale (clamped by the device).
-        let line_width = scale as f32;
-        let lines = |mesh| SceneDraw { wireframe: true, line_width, ..draw(mesh, mvp) };
-        let mut draws = vec![SceneDraw { screen_space: true, ..draw(gpu.background, mvp) }];
-        let mut lit_draws = Vec::new();
-        if let Some(m) = &self.model {
-            let wire = self.show_wire && self.overlays.is_some();
-            if let (true, Some(id)) = (self.show_grid, gpu.grid) {
-                draws.push(lines(id));
-            }
-            // The model, after the background and grid and before the wires.
-            let eye = self.camera.eye().to_array();
-            for (part, &id) in m.surfaces.iter().zip(&gpu.model).take(gpu.model_parts) {
-                let mat = &part.material;
-                lit_draws.push(LitDraw {
-                    mesh: id,
-                    mvp,
-                    eye,
-                    material: LitMaterial {
-                        base_color: mat.color,
-                        texture: mat.texture.and_then(|t| self.texture_ids.get(t).copied().flatten()),
-                        metallic: mat.metallic,
-                        roughness: mat.roughness,
-                    },
-                    opacity: 1.0,
-                    wire_base_width: if wire { line_width } else { 0.0 },
-                    before: draws.len() as u32,
-                });
-            }
-            if let (true, Some(id)) = (wire, gpu.edges) {
-                draws.push(SceneDraw { opacity: WIRE_OPACITY, ..lines(id) });
-            }
-            if let (true, true, Some(id)) = (self.show_normals, self.overlays.is_some(), gpu.normals) {
-                draws.push(lines(id));
-            }
-        }
-        stage.stage_scene((0, 0, pw, ph), draws);
-        if let Some(lit) = stage.lit() {
-            lit.stage_lit(lit_draws);
-        }
-        tracing
     }
 
     fn handle_resize(&mut self, width: f32, height: f32, scale: f64) {
@@ -933,6 +777,168 @@ impl Application for ModelApp {
 
     fn clear_color(&self) -> [f32; 4] {
         [SKY_BOTTOM[0], SKY_BOTTOM[1], SKY_BOTTOM[2], 1.0]
+    }
+}
+
+impl cce_ui::engine::App3D for ModelApp {
+    /// Once per renderer, the first and any replacement after a reconnect:
+    /// a new renderer holds no meshes, so everything goes up again.
+    fn init_3d(&mut self, stage: &mut dyn Stage3D) {
+        // Drawn as a `screen_space` draw: these corners are NDC, at the far
+        // plane, untouched by the mvp; their z is ignored.
+        let bg = |x: f32, y: f32, color: [f32; 3]| Vertex3D { position: [x, y, 0.0], color };
+        let background = stage.create_mesh(&[
+            bg(-1.0, -1.0, SKY_BOTTOM),
+            bg(1.0, -1.0, SKY_BOTTOM),
+            bg(1.0, 1.0, SKY_TOP),
+            bg(-1.0, -1.0, SKY_BOTTOM),
+            bg(1.0, 1.0, SKY_TOP),
+            bg(-1.0, 1.0, SKY_TOP),
+        ]);
+        stage.set_scene_light(light::KEY.normalize().to_array());
+        self.rt_needs_bvh = stage.rt_needs_bvh();
+        match stage.lit() {
+            Some(lit) => lit.set_lit_light(light::rig()),
+            None => self.error = Some("this renderer has no lit pipeline; nothing can be drawn".into()),
+        }
+        // A replacement renderer: the images went with the old one.
+        if std::mem::replace(&mut self.seen_renderer, true) {
+            self.upload_textures();
+        }
+        self.gpu = Some(Gpu { background, model: Vec::new(), model_parts: 0, grid: None, edges: None, normals: None });
+        let has = self.model.is_some();
+        let built = self.overlays.is_some();
+        self.pending = Pending { model: has, grid: has, edges: built, normals: built };
+        // The tracer's scene and its accumulation died with the old renderer.
+        self.trace_uploaded = false;
+        self.trace_announced = false;
+        self.samples = 0;
+        self.scene_dirty = true;
+    }
+
+    fn stage_3d(&mut self, stage: &mut dyn Stage3D, size: LogicalSize, scale: f64) -> bool {
+        let Some(gpu) = self.gpu.as_mut() else { return false };
+        let pending = std::mem::take(&mut self.pending);
+        if let Some(m) = &self.model {
+            if let (true, Some(lit)) = (pending.model, stage.lit()) {
+                // On the UI thread, unavoidably: the stage is only lent here.
+                // Logged, because it is the one part of a load the window waits on.
+                let started = std::time::Instant::now();
+                for (i, part) in m.surfaces.iter().enumerate() {
+                    match gpu.model.get(i) {
+                        Some(&id) => lit.update_lit_mesh(id, &part.verts),
+                        None => gpu.model.push(lit.create_lit_mesh(&part.verts)),
+                    }
+                }
+                gpu.model_parts = m.surfaces.len();
+                let count: usize = m.surfaces.iter().map(|p| p.verts.len()).sum();
+                log::info!("[model] uploaded {count} vertices in {:.0} ms", started.elapsed().as_secs_f64() * 1e3);
+            }
+            if pending.grid {
+                upload(stage, &mut gpu.grid, &m.grid);
+            }
+        }
+        if let Some(o) = &self.overlays {
+            if pending.edges {
+                upload(stage, &mut gpu.edges, &o.edges);
+            }
+            if pending.normals {
+                upload(stage, &mut gpu.normals, &o.normals);
+            }
+        }
+        if pending.model || pending.grid || pending.edges || pending.normals {
+            self.scene_dirty = true;
+        }
+        let (pw, ph) = ((size.width as f64 * scale) as u32, (size.height as f64 * scale) as u32);
+        let view_proj = self.camera.view_proj(pw as f32 / ph.max(1) as f32);
+
+        // The traced view: once the camera has rested, a sample a frame up
+        // to the cap; then nothing, and the backdrop keeps the image.
+        let key = view_key(&self.camera, pw, ph);
+        if key != self.view_key {
+            self.view_key = key;
+            self.moved_at = Instant::now();
+            self.samples = 0;
+            self.trace_began = None;
+        }
+        let tracing = self.traced && self.model.is_some() && self.trace_scene.is_some();
+        if tracing && self.moved_at.elapsed() >= STILL {
+            if self.samples >= self.sample_cap {
+                return false;
+            }
+            if !self.trace_uploaded {
+                // The HUD is painted before this runs: return once so the
+                // frame saying "preparing" is presented, and upload on the
+                // next.
+                if !std::mem::replace(&mut self.trace_announced, true) {
+                    return true;
+                }
+                let started = Instant::now();
+                stage.set_rt_scene_prepared(self.trace_scene.as_ref().unwrap());
+                stage.set_rt_environment(trace::environment(light::KEY.normalize().to_array()));
+                stage.set_rt_background(Some(trace::BACKGROUND));
+                log::info!("[model] trace scene uploaded in {:.0} ms", started.elapsed().as_secs_f64() * 1e3);
+                self.trace_uploaded = true;
+            }
+            let began = *self.trace_began.get_or_insert_with(Instant::now);
+            stage.stage_rt((0, 0, pw, ph), RtCamera { inv_mvp: view_proj.inverse().to_cols_array_2d() });
+            self.samples += 1;
+            // Whatever is staged next (a move's raster frame) must restage.
+            self.scene_dirty = true;
+            if self.samples == self.sample_cap {
+                log::info!("[model] traced {} samples in {:.0} ms; idle", self.samples, began.elapsed().as_secs_f64() * 1e3);
+            }
+            // One frame more than samples: the HUD is painted before this
+            // runs, so the frame after the last sample is the one that says
+            // the cap was reached; that frame stages nothing (above).
+            return true;
+        }
+        if !std::mem::replace(&mut self.scene_dirty, false) {
+            // Still waiting out STILL: keep the frames coming to notice it.
+            return tracing;
+        }
+        let mvp = view_proj.to_cols_array_2d();
+        // One logical px, whatever the output scale (clamped by the device).
+        let line_width = scale as f32;
+        let lines = |mesh| SceneDraw { wireframe: true, line_width, ..draw(mesh, mvp) };
+        let mut draws = vec![SceneDraw { screen_space: true, ..draw(gpu.background, mvp) }];
+        let mut lit_draws = Vec::new();
+        if let Some(m) = &self.model {
+            let wire = self.show_wire && self.overlays.is_some();
+            if let (true, Some(id)) = (self.show_grid, gpu.grid) {
+                draws.push(lines(id));
+            }
+            // The model, after the background and grid and before the wires.
+            let eye = self.camera.eye().to_array();
+            for (part, &id) in m.surfaces.iter().zip(&gpu.model).take(gpu.model_parts) {
+                let mat = &part.material;
+                lit_draws.push(LitDraw {
+                    mesh: id,
+                    mvp,
+                    eye,
+                    material: LitMaterial {
+                        base_color: mat.color,
+                        texture: mat.texture.and_then(|t| self.texture_ids.get(t).copied().flatten()),
+                        metallic: mat.metallic,
+                        roughness: mat.roughness,
+                    },
+                    opacity: 1.0,
+                    wire_base_width: if wire { line_width } else { 0.0 },
+                    before: draws.len() as u32,
+                });
+            }
+            if let (true, Some(id)) = (wire, gpu.edges) {
+                draws.push(SceneDraw { opacity: WIRE_OPACITY, ..lines(id) });
+            }
+            if let (true, true, Some(id)) = (self.show_normals, self.overlays.is_some(), gpu.normals) {
+                draws.push(lines(id));
+            }
+        }
+        stage.stage_scene((0, 0, pw, ph), draws);
+        if let Some(lit) = stage.lit() {
+            lit.stage_lit(lit_draws);
+        }
+        tracing
     }
 }
 
