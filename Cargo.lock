@@ -428,22 +428,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "cce-core"
-version = "0.1.0"
-source = "git+https://github.com/lsgalante/cce-core.git?rev=5b8dcb30f1b0d7d607ab49d637069560eca0cb14#5b8dcb30f1b0d7d607ab49d637069560eca0cb14"
-dependencies = [
- "libc",
- "log",
- "web-time",
-]
-
-[[package]]
 name = "cce-mesh-io"
 version = "0.1.0"
-source = "git+https://github.com/lsgalante/cce-mesh-io.git?rev=6df9e425613913af54011b5231ae2b82d85cee44#6df9e425613913af54011b5231ae2b82d85cee44"
+source = "git+https://github.com/lsgalante/cce-mesh-io.git?rev=42c9bb19f664b4fcd392353b7a76ad7fd3814d34#42c9bb19f664b4fcd392353b7a76ad7fd3814d34"
 dependencies = [
  "base64",
- "cce-core 0.1.0 (git+https://github.com/lsgalante/cce-core.git?rev=5b8dcb30f1b0d7d607ab49d637069560eca0cb14)",
+ "cce-core",
  "glam",
  "gltf",
  "image",
@@ -472,7 +462,7 @@ dependencies = [
  "bytemuck",
  "calloop",
  "calloop-wayland-source",
- "cce-core 0.1.0 (git+https://github.com/lsgalante/cce-core.git?rev=388473078207ff41208e8648c04499e94632f20a)",
+ "cce-core",
  "chrono",
  "cosmic-text",
  "cursor-icon",
