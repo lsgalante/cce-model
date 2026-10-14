@@ -9,7 +9,7 @@ use glam::Vec3;
 /// The smallest of 1, 2 or 5 × 10ⁿ that is at least `raw`: a step a ruler
 /// would use.
 pub fn nice_step(raw: f32) -> f32 {
-    if !(raw > 0.0) || !raw.is_finite() {
+    if !raw.is_finite() || raw <= 0.0 {
         return 1.0;
     }
     // In f64, so 5 × 10⁻² comes out as the f32 nearest 0.05, not a hair

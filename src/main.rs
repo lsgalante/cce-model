@@ -2,8 +2,8 @@
 //!
 //! Opens STL, OBJ, glTF/GLB and PLY (read by cce-mesh-io), frames the model
 //! in a three-quarter view over a grid floor and lets you turn it. Files are
-//! read and split into lit meshes on a worker thread (`cce_mesh_io::load`
-//! + `light::lit_parts`, one per material), then uploaded once and drawn
+//! read and split into lit meshes on a worker thread (`cce_mesh_io::load` +
+//! `light::lit_parts`, one per material), then uploaded once and drawn
 //! through cce-ui's lit pipeline — per-fragment light, metallic-roughness
 //! specular, base-colour textures — between a screen-space background
 //! gradient and the grid. The whole window is the scene. The wireframe and normals overlays are built on a worker the
@@ -432,7 +432,7 @@ fn group_thousands(n: usize) -> String {
     let digits = n.to_string();
     let mut out = String::new();
     for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i) % 3 == 0 {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(c);
@@ -611,7 +611,7 @@ impl Application for ModelApp {
     }
 
     fn handle_pointer_move(&mut self, pos: LogicalPosition, needs_rebuild: &mut bool) {
-        let (x, y) = (pos.x as f32, pos.y as f32);
+        let (x, y) = (pos.x, pos.y);
         let (dx, dy) = (x - self.pointer.0, y - self.pointer.1);
         self.pointer = (x, y);
         match self.drag {
@@ -630,7 +630,7 @@ impl Application for ModelApp {
         pos: LogicalPosition,
         _needs_rebuild: &mut bool,
     ) -> Option<Message> {
-        self.pointer = (pos.x as f32, pos.y as f32);
+        self.pointer = (pos.x, pos.y);
         if state == ElementState::Released {
             self.drag = None;
             return None;
