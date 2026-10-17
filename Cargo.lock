@@ -459,6 +459,8 @@ dependencies = [
  "env_logger",
  "glam",
  "log",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

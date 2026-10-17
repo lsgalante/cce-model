@@ -26,6 +26,7 @@ mod files;
 mod light;
 mod overlay;
 mod trace;
+mod ui_state;
 mod units;
 
 use std::path::{Path, PathBuf};
@@ -179,6 +180,11 @@ struct ModelApp {
     generation: u64,
     loading: Option<PathBuf>,
     model: Option<Arc<Model>>,
+    /// The file `model` was read from, for `ui_state`.
+    model_path: Option<PathBuf>,
+    /// The saved view to take up when the model reopened at launch arrives
+    /// (`ui_state`); any other open drops it.
+    restore_view: Option<ui_state::View>,
     error: Option<String>,
     /// The model's textures as this renderer's image ids, by the scene's
     /// texture index (`None` for one that is not uploaded).
@@ -244,6 +250,7 @@ impl ModelApp {
     /// Read `path` on a worker. A file opened from outside the folder list
     /// (the dialog, a drop, the command line) makes its folder the list.
     fn open(&mut self, path: PathBuf, new_folder: bool) {
+        self.restore_view = None;
         if new_folder {
             (self.files, self.file_at) = files::siblings(&path);
         }
@@ -366,6 +373,12 @@ impl ModelApp {
         self.scene_dirty = true;
     }
 
+    /// The camera as `ui_state` keeps it.
+    fn view(&self) -> ui_state::View {
+        let c = &self.camera;
+        ui_state::View { pivot: c.pivot.to_array(), yaw: c.yaw, pitch: c.pitch, distance: c.distance }
+    }
+
     fn frame_all(&mut self) {
         if self.model.is_some() {
             self.camera.frame(Vec3::ZERO, 1.0, self.aspect());
@@ -475,6 +488,8 @@ impl Application for ModelApp {
             generation: 0,
             loading: None,
             model: None,
+            model_path: None,
+            restore_view: None,
             error: None,
             texture_ids: Vec::new(),
             seen_renderer: false,
@@ -508,8 +523,12 @@ impl Application for ModelApp {
             win: (1000.0, 750.0),
             scale: 1.0,
         };
-        if let Some(path) = std::env::args_os().nth(1) {
-            app.open(PathBuf::from(path), true);
+        // The model the command line names, or the one this viewer had open
+        // when the same command line last ran (`ui_state`), in its view.
+        let restore = ui_state::initial(std::env::args_os().nth(1).map(PathBuf::from));
+        if let Some(path) = restore.file {
+            app.open(path, true);
+            app.restore_view = restore.view;
         }
         app
     }
@@ -530,6 +549,7 @@ impl Application for ModelApp {
                     return;
                 }
                 self.loading = None;
+                let restore_view = self.restore_view.take();
                 match result {
                     Ok(model) => {
                         log::info!(
@@ -550,6 +570,11 @@ impl Application for ModelApp {
                         self.trace_announced = false;
                         self.samples = 0;
                         self.frame_all();
+                        if let Some(v) = restore_view {
+                            self.camera.restore(Vec3::from_array(v.pivot), v.yaw, v.pitch, v.distance);
+                        }
+                        ui_state::save(&path, self.view());
+                        self.model_path = Some(path.clone());
                         self.want_overlays();
                         self.want_trace();
                     }
@@ -773,6 +798,13 @@ impl Application for ModelApp {
             pc.text(HINTS, inset, size.height - inset - 14.0, 11.0, [120, 122, 132]);
         }
         Some(pc.finish())
+    }
+
+    /// Keep the view for the next launch: a restart replays this one.
+    fn on_exit(&mut self) {
+        if let Some(path) = &self.model_path {
+            ui_state::save(path, self.view());
+        }
     }
 
     fn clear_color(&self) -> [f32; 4] {

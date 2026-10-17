@@ -96,6 +96,20 @@ impl Camera {
         self.pivot += (-right * dx + up * dy) * per_px;
     }
 
+    /// Take up a view saved earlier, kept within what `orbit` and `zoom`
+    /// allow and with the pivot near the model (`CLIP_RADII` round the
+    /// origin). A view that cannot be shown (not finite) is refused: false.
+    pub fn restore(&mut self, pivot: Vec3, yaw: f32, pitch: f32, distance: f32) -> bool {
+        if !(pivot.is_finite() && yaw.is_finite() && pitch.is_finite() && distance.is_finite()) {
+            return false;
+        }
+        self.pivot = pivot.clamp_length_max(CLIP_RADII * self.radius);
+        self.yaw = yaw.rem_euclid(std::f32::consts::TAU);
+        self.pitch = pitch.clamp(-MAX_PITCH, MAX_PITCH);
+        self.distance = distance.clamp(self.radius * 1e-3, self.radius * 100.0);
+        true
+    }
+
     /// Move the eye toward the pivot (`factor` < 1) or away from it.
     pub fn zoom(&mut self, factor: f32) {
         self.distance = (self.distance * factor).clamp(self.radius * 1e-3, self.radius * 100.0);
@@ -150,6 +164,17 @@ mod tests {
         cam.orbit(100.0, 0.0);
         // The eye has swung toward -X, the side that was on the left.
         assert!(cam.eye().dot(left) > 0.0);
+    }
+
+    #[test]
+    fn a_restored_view_is_kept_within_bounds() {
+        let mut cam = Camera::default();
+        assert!(cam.restore(Vec3::new(50.0, 0.0, 0.0), 1.0, 3.0, 1e6));
+        assert!(cam.pivot.length() <= CLIP_RADII * cam.radius + 1e-4);
+        assert!(cam.pitch <= MAX_PITCH && cam.distance <= cam.radius * 100.0);
+        let before = cam.clone();
+        assert!(!cam.restore(Vec3::ZERO, f32::NAN, 0.0, 2.0));
+        assert_eq!(cam.yaw, before.yaw);
     }
 
     #[test]

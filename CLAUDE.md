@@ -91,6 +91,12 @@ light, metallic-roughness, base-colour textures).
   5M with its BVH, on top of the baked vertices).
 - **The tracer has no smooth normals**: a coarse sphere shows its facets
   when traced. Milestone 5's territory (cce-ui's materials and vertices).
+- **A launch reopens where the viewer was** (`src/ui_state.rs`): the model
+  and the camera, in `<XDG state>/cce/model/state.json`, saved when a model
+  opens and in `on_exit`. A restart replays the same argv, so the file also
+  keeps the path argv named: the same argv (or none) reopens the saved model
+  in its saved view; argv naming another file opens that, framed. A saved
+  model that is gone is skipped. It only reopens; it writes no model file.
 - No root plate, on purpose (`style-audit: opt-out` in `display_list`): the
   scene is the window's content, and a root plate would frost over it.
 
