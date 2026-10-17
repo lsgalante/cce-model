@@ -416,7 +416,17 @@ dependencies = [
 [[package]]
 name = "cce-core"
 version = "0.1.0"
-source = "git+https://github.com/lsgalante/cce-core.git?rev=33bc46f1cbede6cda770683932c626667805d326#33bc46f1cbede6cda770683932c626667805d326"
+source = "git+https://github.com/lsgalante/cce-core.git?rev=388473078207ff41208e8648c04499e94632f20a#388473078207ff41208e8648c04499e94632f20a"
+dependencies = [
+ "libc",
+ "log",
+ "web-time",
+]
+
+[[package]]
+name = "cce-core"
+version = "0.1.0"
+source = "git+https://github.com/lsgalante/cce-core.git?rev=cfe7a9307866896bdd1dd4319c44a6cb6f33db21#cfe7a9307866896bdd1dd4319c44a6cb6f33db21"
 dependencies = [
  "fluent-bundle",
  "kdl",
@@ -424,16 +434,6 @@ dependencies = [
  "log",
  "serde_json",
  "unic-langid",
- "web-time",
-]
-
-[[package]]
-name = "cce-core"
-version = "0.1.0"
-source = "git+https://github.com/lsgalante/cce-core.git?rev=388473078207ff41208e8648c04499e94632f20a#388473078207ff41208e8648c04499e94632f20a"
-dependencies = [
- "libc",
- "log",
  "web-time",
 ]
 
@@ -464,7 +464,7 @@ dependencies = [
 [[package]]
 name = "cce-ui"
 version = "0.1.0"
-source = "git+https://github.com/lsgalante/cce-ui.git?rev=2ce6a82b9eeab395f8f16c6054559721967696e5#2ce6a82b9eeab395f8f16c6054559721967696e5"
+source = "git+https://github.com/lsgalante/cce-ui.git?rev=dc5eee9ae67076a9945e1edd8ffc82714987f1ef#dc5eee9ae67076a9945e1edd8ffc82714987f1ef"
 dependencies = [
  "accesskit",
  "ash",
@@ -472,7 +472,7 @@ dependencies = [
  "bytemuck",
  "calloop",
  "calloop-wayland-source",
- "cce-core 0.1.0 (git+https://github.com/lsgalante/cce-core.git?rev=33bc46f1cbede6cda770683932c626667805d326)",
+ "cce-core 0.1.0 (git+https://github.com/lsgalante/cce-core.git?rev=cfe7a9307866896bdd1dd4319c44a6cb6f33db21)",
  "chrono",
  "cosmic-text",
  "cursor-icon",
